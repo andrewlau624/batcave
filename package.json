@@ -1,6 +1,6 @@
 {
   "name": "bonsai",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "A worktree-aware terminal: repos → branches → tabs, with .env files carried into every git worktree.",
   "author": "Andrew Lau",
   "license": "MIT",
