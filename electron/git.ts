@@ -37,6 +37,21 @@ export async function currentBranch(repoPath: string): Promise<string> {
 export const REBASE_IN_PROGRESS_MARKER = '__BONSAI_REBASE_IN_PROGRESS__'
 
 /**
+ * Thrown by `pull()` when git refuses to update the working tree because local
+ * changes or untracked files would be clobbered. The renderer keys off this to
+ * offer a one-click "stash + pull + re-apply" instead of dumping git's (very
+ * long) raw refusal into an alert.
+ */
+export const PULL_DIRTY_TREE_MARKER = '__BONSAI_PULL_DIRTY_TREE__'
+
+/**
+ * Thrown by `pullAutostash()` when the pull succeeded but re-applying the
+ * stashed local changes hit a conflict. The changes are preserved in the stash;
+ * the renderer tells the user to resolve them in their editor.
+ */
+export const PULL_AUTOSTASH_CONFLICT_MARKER = '__BONSAI_PULL_AUTOSTASH_CONFLICT__'
+
+/**
  * Detect whether `repoPath`'s primary checkout is currently mid-rebase. Works
  * for both the `apply` (am) and `merge` (interactive) backends.
  */
@@ -136,12 +151,92 @@ export async function ensureWorktree(
   if (!worktreePath) {
     const dir = path.join(WORKTREES_ROOT, sanitizeBranch(repoName), sanitizeBranch(branch))
     fs.mkdirSync(path.dirname(dir), { recursive: true })
-    await g.raw(['worktree', 'add', dir, branch])
-    worktreePath = dir
+    worktreePath = await addWorktreeResilient(g, repoPath, dir, branch)
   }
 
   const carriedEnvFiles = carryEnv ? carryEnvFiles(repoPath, worktreePath) : []
   return { repoId: '', branch, path: worktreePath, primary: false, carriedEnvFiles }
+}
+
+/** A linked worktree keeps a `.git` *file* (not a directory) at its root. */
+function isLinkedWorktree(dir: string): boolean {
+  try {
+    return fs.statSync(path.join(dir, '.git')).isFile()
+  } catch {
+    return false
+  }
+}
+
+/**
+ * `git worktree add`, but resilient to a stale leftover directory already
+ * sitting at `dir`. This is the root cause of the recurring
+ * "fatal: '…' already exists" error: a worktree dir survives without a live
+ * registration (after a crash, a half-finished `worktree remove`, or branch
+ * drift), and a plain add then refuses.
+ *
+ * Recovery order, all non-destructive to committed/uncommitted work:
+ *   1. prune dead registrations, then reuse any live worktree for this branch/path
+ *   2. repair + reuse a detached-but-valid linked worktree at `dir`
+ *   3. remove a clearly-empty orphan folder and retry the add
+ *   4. otherwise surface a clear, actionable error (never raw git output)
+ */
+async function addWorktreeResilient(
+  g: SimpleGit,
+  repoPath: string,
+  dir: string,
+  branch: string,
+): Promise<string> {
+  try {
+    await g.raw(['worktree', 'add', dir, branch])
+    return dir
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    if (!/already exists/i.test(msg)) throw err
+
+    // (1) Clear registrations whose dirs are gone, then see whether a live
+    // worktree for this branch — or at this exact path — surfaced.
+    await g.raw(['worktree', 'prune']).catch(() => {})
+    let trees = await listWorktrees(repoPath)
+    const forBranch = trees.find((w) => w.branch === branch)
+    if (forBranch) return forBranch.path
+    const atPath = trees.find((w) => path.resolve(w.path) === path.resolve(dir))
+    if (atPath) return atPath.path
+
+    // The dir vanished during prune — retry a clean add.
+    if (!fs.existsSync(dir)) {
+      await g.raw(['worktree', 'add', dir, branch])
+      return dir
+    }
+
+    // (2) A valid linked worktree is sitting there unregistered — re-link it.
+    if (isLinkedWorktree(dir)) {
+      await g.raw(['worktree', 'repair', dir]).catch(() => {})
+      trees = await listWorktrees(repoPath)
+      const repaired = trees.find((w) => path.resolve(w.path) === path.resolve(dir))
+      if (repaired) return repaired.path
+    }
+
+    // (3) An orphan folder with no git linkage. Remove it only when empty so we
+    // never discard files that git isn't tracking, then retry.
+    let empty = false
+    try {
+      empty = fs.readdirSync(dir).length === 0
+    } catch {
+      /* unreadable — treat as non-empty and bail to the safe error below */
+    }
+    if (empty) {
+      fs.rmSync(dir, { recursive: true, force: true })
+      await g.raw(['worktree', 'add', dir, branch])
+      return dir
+    }
+
+    // (4) Can't safely reclaim it — tell the user exactly what to do.
+    throw new Error(
+      `A leftover folder is blocking the worktree for "${branch}":\n${dir}\n\n` +
+        `It isn't a tracked git worktree and isn't empty, so Bonsai won't delete it ` +
+        `automatically. Move or remove that folder, then try again.`,
+    )
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -441,8 +536,46 @@ export async function push(cwd: string): Promise<string> {
   return git(cwd).raw(['push'])
 }
 
+/** Git's working-tree-would-be-clobbered refusals, all of which a stash fixes. */
+function isDirtyTreePullError(message: string): boolean {
+  return /would be overwritten|commit your changes or stash|cannot fast-forward your working tree/i.test(
+    message,
+  )
+}
+
 export async function pull(cwd: string): Promise<string> {
-  return git(cwd).raw(['pull'])
+  try {
+    return await git(cwd).raw(['pull'])
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    if (isDirtyTreePullError(msg)) throw new Error(PULL_DIRTY_TREE_MARKER)
+    throw err
+  }
+}
+
+/**
+ * Stash everything (including untracked files), pull, then re-apply the stash.
+ * Used after `pull()` reports a dirty tree. The stash keeps the user's work
+ * safe: if re-applying conflicts, git leaves the stash in place and we throw
+ * PULL_AUTOSTASH_CONFLICT_MARKER so the renderer can explain.
+ */
+export async function pullAutostash(cwd: string): Promise<string> {
+  const g = git(cwd)
+  await g.raw(['stash', 'push', '--include-untracked', '-m', 'bonsai: auto-stash before pull'])
+  let pullOut: string
+  try {
+    pullOut = await g.raw(['pull'])
+  } catch (err) {
+    // Pull failed for some other reason — undo the stash so the tree is restored.
+    await g.raw(['stash', 'pop']).catch(() => {})
+    throw err
+  }
+  try {
+    const popOut = await g.raw(['stash', 'pop'])
+    return `${pullOut}\n${popOut}`.trim()
+  } catch {
+    throw new Error(PULL_AUTOSTASH_CONFLICT_MARKER)
+  }
 }
 
 // ---------------------------------------------------------------------------

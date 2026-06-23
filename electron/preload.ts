@@ -37,6 +37,7 @@ const api: BonsaiApi = {
     commit: (cwd, message) => ipcRenderer.invoke('git:commit', cwd, message) as Promise<void>,
     push: (cwd) => ipcRenderer.invoke('git:push', cwd) as Promise<string>,
     pull: (cwd) => ipcRenderer.invoke('git:pull', cwd) as Promise<string>,
+    pullAutostash: (cwd) => ipcRenderer.invoke('git:pullAutostash', cwd) as Promise<string>,
     fetch: (repoId) => ipcRenderer.invoke('git:fetch', repoId) as Promise<void>,
     checkout: (repoId, branch) =>
       ipcRenderer.invoke('git:checkout', repoId, branch) as Promise<void>,

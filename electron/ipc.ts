@@ -101,6 +101,7 @@ export function registerIpc(): void {
   ipcMain.handle('git:commit', (_e, cwd: string, message: string) => gitOps.commit(cwd, message))
   ipcMain.handle('git:push', (_e, cwd: string) => gitOps.push(cwd))
   ipcMain.handle('git:pull', (_e, cwd: string) => gitOps.pull(cwd))
+  ipcMain.handle('git:pullAutostash', (_e, cwd: string) => gitOps.pullAutostash(cwd))
   ipcMain.handle('git:fetch', (_e, repoId: string) => gitOps.fetch(repoPath(repoId)))
   ipcMain.handle('git:checkout', (_e, repoId: string, branch: string) =>
     gitOps.checkout(repoPath(repoId), branch),

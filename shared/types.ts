@@ -297,6 +297,8 @@ export interface BonsaiApi {
     commit(cwd: string, message: string): Promise<void>
     push(cwd: string): Promise<string>
     pull(cwd: string): Promise<string>
+    /** Stash (incl. untracked), pull, then re-apply — used after a dirty-tree pull refusal. */
+    pullAutostash(cwd: string): Promise<string>
     fetch(repoId: string): Promise<void>
     /** Switch the primary checkout's HEAD to `branch` (git switch). */
     checkout(repoId: string, branch: string): Promise<void>

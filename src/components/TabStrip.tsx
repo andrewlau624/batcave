@@ -47,6 +47,9 @@ export function TabStrip() {
   // branch is open by default; users can flip a sibling open and we remember it
   // until the active branch changes.
   const [expandedOverride, setExpandedOverride] = useState<Set<string>>(new Set())
+  // Ports start collapsed so they don't crowd the branch row; expanded on click
+  // (and always while a port pane is the active view, so it stays reachable).
+  const [portsExpanded, setPortsExpanded] = useState(false)
   const lastTabByRepo = useRef<Record<string, string>>({})
   const lastTabByBranch = useRef<Record<string, string>>({})
 
@@ -322,35 +325,47 @@ export function TabStrip() {
       </div>
       {/* Row 2: branches + terminals of the active repo (scrolls horizontally). */}
       <div className="tabbar-row tabbar-branches">
-        {previewTabs.length > 0 && (
-          <div className="ports-grp">
-            <span className="ports-label">
-              <Icon name="globe" size={11} />
-              <span className="tab-name">Ports</span>
-            </span>
-            {previewTabs.map((pt) => (
-              <div
-                key={pt.id}
-                className={`tab-chip${activePane === pt.id ? ' active' : ''}`}
-                title={pt.url}
-                onClick={() => setPaneActive(pt.id)}
-              >
-                <Icon name="globe" size={12} />
-                <span className="tab-name">{previewLabel(pt.url)}</span>
+        {previewTabs.length > 0 &&
+          (() => {
+            const portActive = previewTabs.some((pt) => pt.id === activePane)
+            const showPorts = portsExpanded || portActive
+            return (
+              <div className={`ports-grp${showPorts ? ' expanded' : ''}`}>
                 <button
-                  className="tab-close"
-                  title="Close port"
-                  onClick={(e) => {
-                    e.stopPropagation()
-                    closePreviewTab(pt.id)
-                  }}
+                  className="ports-label"
+                  title={showPorts ? 'Collapse ports' : 'Show ports'}
+                  onClick={() => setPortsExpanded((v) => !v)}
                 >
-                  <Icon name="close" size={12} />
+                  <Icon name="globe" size={11} />
+                  <span className="tab-name">Ports</span>
+                  <span className="tab-count">{previewTabs.length}</span>
+                  <Icon name="chevron" size={11} className={`chevron ${showPorts ? 'open' : ''}`} />
                 </button>
+                {showPorts &&
+                  previewTabs.map((pt) => (
+                    <div
+                      key={pt.id}
+                      className={`tab-chip${activePane === pt.id ? ' active' : ''}`}
+                      title={pt.url}
+                      onClick={() => setPaneActive(pt.id)}
+                    >
+                      <Icon name="globe" size={12} />
+                      <span className="tab-name">{previewLabel(pt.url)}</span>
+                      <button
+                        className="tab-close"
+                        title="Close port"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          closePreviewTab(pt.id)
+                        }}
+                      >
+                        <Icon name="close" size={12} />
+                      </button>
+                    </div>
+                  ))}
               </div>
-            ))}
-          </div>
-        )}
+            )
+          })()}
         {activeRepoId && renderActiveRepoBody(activeRepoId)}
       </div>
     </div>

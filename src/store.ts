@@ -165,6 +165,7 @@ interface AppState {
   closeTab: (id: string) => void
   setTabTitle: (id: string, title: string) => void
   setTabProcess: (id: string, name: string) => void
+  syncBranchFromStatus: (tabId: string, actualBranch: string) => void
   selectTurn: (turnId: string | null) => Promise<void>
   endTurnNow: (tabId: string) => Promise<void>
   togglePinTab: (id: string) => void
@@ -741,6 +742,13 @@ export const useApp = create<AppState>((set, get) => ({
 
     // busy → idle: close the most recent unfinished turn for this tab.
     if (wasBusy && !isBusy) {
+      // A just-finished command may have switched branches — re-check this tab's
+      // HEAD and relabel it if it drifted, even when it isn't the active tab.
+      void window.bonsai.git
+        .status(tab.cwd)
+        .then((st) => get().syncBranchFromStatus(id, st.branch))
+        .catch(() => {})
+
       const list = get().turnsByTab[id] ?? []
       const open = list.find((t) => !t.endedAt)
       if (!open) return
@@ -865,9 +873,43 @@ export const useApp = create<AppState>((set, get) => ({
     try {
       const status = await window.bonsai.git.status(tab.cwd)
       set((s) => ({ statusByCwd: { ...s.statusByCwd, [tab.cwd]: status } }))
+      // The checkout may have been switched out from under us (e.g. an agent ran
+      // `git switch` in this terminal). Relabel the tab to match reality.
+      get().syncBranchFromStatus(tab.id, status.branch)
     } catch (err) {
       console.error('status failed', err)
     }
+  },
+
+  // Reconcile a tab's branch label with the checkout's *actual* current branch.
+  // External `git switch`/`git checkout` (commonly run by AI agents) silently
+  // drift a checkout's HEAD; without this the tab keeps its old branch name.
+  // Every tab pointing at the same cwd shares one HEAD, so they all move together.
+  syncBranchFromStatus: (tabId, actualBranch) => {
+    if (!actualBranch || actualBranch.startsWith('(')) return
+    const tab = get().tabs.find((t) => t.id === tabId)
+    if (!tab || isLocalTab(tab) || tab.branch === actualBranch) return
+    const { repoId, cwd, branch: oldBranch } = tab
+    const oldKey = branchKey(repoId, oldBranch)
+    const newKey = branchKey(repoId, actualBranch)
+    set((s) => {
+      const tabs = s.tabs.map((t) =>
+        t.repoId === repoId && t.cwd === cwd
+          ? { ...t, branch: actualBranch, title: t.title === t.branch ? actualBranch : t.title }
+          : t,
+      )
+      const worktrees = { ...s.worktrees }
+      const prevWt = worktrees[oldKey]
+      if (prevWt) {
+        worktrees[newKey] = { ...prevWt, branch: actualBranch }
+        delete worktrees[oldKey]
+      }
+      const expandedBranches = new Set(s.expandedBranches)
+      if (expandedBranches.delete(oldKey)) expandedBranches.add(newKey)
+      return { tabs, worktrees, expandedBranches }
+    })
+    void get().reloadBranches(repoId)
+    get().persist()
   },
 
   stage: async (file) => {
@@ -932,7 +974,36 @@ export const useApp = create<AppState>((set, get) => ({
       else await window.bonsai.git.fetch(tab.repoId)
       await get().refreshStatus()
     } catch (err) {
-      alert(`${op} failed:\n${(err as Error).message}`)
+      const msg = (err as Error).message
+      // Surfaced by electron/git.ts pull() when local changes or untracked files
+      // would be clobbered — offer to stash everything, pull, and re-apply.
+      if (op === 'pull' && msg === '__BONSAI_PULL_DIRTY_TREE__') {
+        const ok = confirm(
+          `Can't pull: your local changes (or new untracked files) would be overwritten ` +
+            `by the incoming update.\n\n` +
+            `Stash everything (including untracked files), pull, then re-apply your changes on top?`,
+        )
+        if (ok) {
+          try {
+            await window.bonsai.git.pullAutostash(tab.cwd)
+          } catch (e) {
+            const m = (e as Error).message
+            if (m === '__BONSAI_PULL_AUTOSTASH_CONFLICT__') {
+              alert(
+                `Pulled successfully, but your stashed local changes couldn't be re-applied ` +
+                  `cleanly (they overlap with what was pulled).\n\n` +
+                  `Nothing was lost — your work is preserved in the stash. Reconcile it from a ` +
+                  `terminal with "git stash list" then "git stash pop" / "git stash drop".`,
+              )
+            } else {
+              alert(`Pull failed:\n${m}`)
+            }
+          }
+          await get().refreshStatus()
+        }
+        return
+      }
+      alert(`${op} failed:\n${msg}`)
     } finally {
       set({ syncing: null })
     }
@@ -1295,13 +1366,29 @@ export const useApp = create<AppState>((set, get) => ({
   closeModal: () => set({ modal: null }),
 
   createBranch: async (repoId, name) => {
+    const clean = name.trim()
+    if (!clean) return
     try {
-      await window.bonsai.git.createBranch(repoId, name)
-      await get().reloadBranches(repoId)
-      set({ modal: null })
+      await window.bonsai.git.createBranch(repoId, clean)
     } catch (err) {
-      alert(`Could not create branch:\n${(err as Error).message}`)
+      const msg = (err as Error).message
+      // The branch already exists — that's not an error here. Fall through and
+      // just reveal it (the user clearly wants to work on it).
+      if (!/already exists/i.test(msg)) {
+        alert(`Could not create branch:\n${msg}`)
+        return
+      }
     }
+    await get().reloadBranches(repoId)
+    // When the user has curated a branch subset, a freshly made branch would be
+    // hidden — add it so it shows up immediately.
+    const prefs = get().branchPrefsByRepo[repoId]
+    if (prefs && !prefs.includes(clean)) {
+      await get().setIncludedBranches(repoId, [...prefs, clean])
+    }
+    set({ modal: null })
+    // Open it so it visibly "appears" (its own worktree + terminal tab).
+    await get().openBranch(repoId, clean)
   },
 
   requestDeleteBranch: (repoId, branch) => {
