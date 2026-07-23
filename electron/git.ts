@@ -31,10 +31,13 @@ export async function currentBranch(repoPath: string): Promise<string> {
 }
 
 /**
- * Marker prefix on errors thrown from `checkout()` when the primary checkout is
- * mid-rebase. The renderer keys off this to offer a one-click "abort + retry".
+ * Marker prefix on errors thrown from `checkout()` when the primary checkout
+ * has an unfinished operation blocking `git switch`. Format:
+ *   `${OPERATION_IN_PROGRESS_MARKER}:${kind}:${branch}`
+ * where `kind` is one of the values `inProgressOperation()` returns. The
+ * renderer keys off this to offer a one-click "abort + retry".
  */
-export const REBASE_IN_PROGRESS_MARKER = '__BONSAI_REBASE_IN_PROGRESS__'
+export const OPERATION_IN_PROGRESS_MARKER = '__BONSAI_OPERATION_IN_PROGRESS__'
 
 /**
  * Thrown by `pull()` when git refuses to update the working tree because local
@@ -52,23 +55,63 @@ export const PULL_DIRTY_TREE_MARKER = '__BONSAI_PULL_DIRTY_TREE__'
 export const PULL_AUTOSTASH_CONFLICT_MARKER = '__BONSAI_PULL_AUTOSTASH_CONFLICT__'
 
 /**
- * Detect whether `repoPath`'s primary checkout is currently mid-rebase. Works
- * for both the `apply` (am) and `merge` (interactive) backends.
+ * Thrown by `checkout()` when the primary checkout has uncommitted changes
+ * that `git switch` would clobber. The renderer offers a one-click "stash +
+ * switch + re-apply" via `checkoutAutostash()`.
  */
-export function isRebaseInProgress(repoPath: string): boolean {
+export const SWITCH_DIRTY_TREE_MARKER = '__BONSAI_SWITCH_DIRTY_TREE__'
+
+/**
+ * Thrown by `checkoutAutostash()` when the switch succeeded but re-applying
+ * the stashed local changes hit a conflict on the new branch. The changes are
+ * preserved in the stash; the renderer explains how to reconcile them.
+ */
+export const SWITCH_AUTOSTASH_CONFLICT_MARKER = '__BONSAI_SWITCH_AUTOSTASH_CONFLICT__'
+
+export type InProgressOp = 'rebase' | 'merge' | 'cherry-pick' | 'revert' | 'bisect'
+
+/**
+ * Detect any in-progress git operation that blocks `git switch`. Rebase covers
+ * both the `apply` (am) and `merge` (interactive) backends. All of these leave
+ * distinctive files or dirs under `.git/` while pending.
+ */
+export function inProgressOperation(repoPath: string): InProgressOp | null {
   const gitDir = path.join(repoPath, '.git')
-  // In primary checkouts `.git` is a dir; in linked worktrees it's a file
-  // pointing at the real gitdir. The primary repoPath we get here is always a
-  // real checkout, so the simple form is enough.
-  return (
-    fs.existsSync(path.join(gitDir, 'rebase-merge')) ||
-    fs.existsSync(path.join(gitDir, 'rebase-apply'))
-  )
+  const has = (name: string) => fs.existsSync(path.join(gitDir, name))
+  if (has('rebase-merge') || has('rebase-apply')) return 'rebase'
+  if (has('MERGE_HEAD')) return 'merge'
+  if (has('CHERRY_PICK_HEAD')) return 'cherry-pick'
+  if (has('REVERT_HEAD')) return 'revert'
+  if (has('BISECT_LOG')) return 'bisect'
+  return null
 }
 
-/** Abort an in-progress rebase, restoring the original HEAD. */
-export async function rebaseAbort(repoPath: string): Promise<void> {
-  await git(repoPath).raw(['rebase', '--abort'])
+/** Abort whatever operation `inProgressOperation` reports, restoring HEAD. */
+export async function abortInProgressOperation(repoPath: string): Promise<void> {
+  const op = inProgressOperation(repoPath)
+  if (!op) return
+  const g = git(repoPath)
+  switch (op) {
+    case 'rebase':
+      await g.raw(['rebase', '--abort'])
+      return
+    case 'merge':
+      await g.raw(['merge', '--abort'])
+      return
+    case 'cherry-pick':
+      await g.raw(['cherry-pick', '--abort'])
+      return
+    case 'revert':
+      await g.raw(['revert', '--abort'])
+      return
+    case 'bisect':
+      await g.raw(['bisect', 'reset'])
+      return
+    default: {
+      const _exhaustive: never = op
+      throw new Error(`Unhandled in-progress op: ${_exhaustive}`)
+    }
+  }
 }
 
 interface RawWorktree {
@@ -268,20 +311,36 @@ export async function fetch(repoPath: string): Promise<void> {
   await git(repoPath).raw(['fetch', '--all', '--prune'])
 }
 
+/** Git's "your changes would be clobbered" refusals, all fixable by a stash. */
+function isDirtyTreeSwitchError(message: string): boolean {
+  return /would be overwritten|commit your changes or stash|please commit or stash/i.test(
+    message,
+  )
+}
+
 /**
- * Switch the primary checkout's HEAD to `branch`. If `branch` is currently held
- * by a managed worktree, that worktree is removed first (git forbids the same
- * branch checked out in two places) — but only when it's clean, so uncommitted
- * work is never silently discarded.
+ * Switch the primary checkout's HEAD to `branch`. Handles the common blockers:
+ *   1. In-progress rebase/merge/cherry-pick/revert/bisect → structured marker
+ *      so the renderer offers a one-click abort + retry.
+ *   2. `branch` held by a managed worktree → drop the worktree first (clean
+ *      only, so uncommitted work is never silently discarded). Stale
+ *      registrations are pruned before we give up.
+ *   3. Local changes that `git switch` would clobber → structured marker so
+ *      the renderer offers a one-click stash + switch + re-apply.
  */
 export async function checkout(repoPath: string, branch: string): Promise<void> {
   const g = git(repoPath)
 
-  // Mid-rebase, `git switch` refuses with a fatal error. Surface a structured
-  // marker so the renderer can offer a one-click "abort and retry" affordance.
-  if (isRebaseInProgress(repoPath)) {
-    throw new Error(`${REBASE_IN_PROGRESS_MARKER}:${branch}`)
+  // (1) Mid-operation, `git switch` refuses. Surface a structured marker so
+  // the renderer can offer a one-click "abort and retry" affordance.
+  const op = inProgressOperation(repoPath)
+  if (op) {
+    throw new Error(`${OPERATION_IN_PROGRESS_MARKER}:${op}:${branch}`)
   }
+
+  // (2) Clean out stale worktree registrations up front — folders manually
+  // deleted from disk otherwise keep tripping "worktree is already using X".
+  await g.raw(['worktree', 'prune']).catch(() => {})
 
   const heldElsewhere = async () => {
     const wt = (await listWorktrees(repoPath)).find((w) => w.branch === branch)
@@ -293,10 +352,11 @@ export async function checkout(repoPath: string, branch: string): Promise<void> 
     try {
       await g.raw(['worktree', 'remove', wt.path])
     } catch {
-      // The dir may have been deleted manually (stale registration) — prune and
-      // see if that cleared it. If a real, dirty worktree still holds the
-      // branch, stop rather than risk discarding uncommitted work.
-      await g.raw(['worktree', 'prune'])
+      // The dir may have been deleted manually (stale registration) — a second
+      // prune sometimes clears entries the first pass missed. If a real,
+      // dirty worktree still holds the branch, stop rather than risk
+      // discarding uncommitted work.
+      await g.raw(['worktree', 'prune']).catch(() => {})
       if (await heldElsewhere()) {
         throw new Error(
           `"${branch}" is open in a worktree with uncommitted changes.\n` +
@@ -305,7 +365,38 @@ export async function checkout(repoPath: string, branch: string): Promise<void> 
       }
     }
   }
-  await g.raw(['switch', branch])
+
+  try {
+    await g.raw(['switch', branch])
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    if (isDirtyTreeSwitchError(msg)) throw new Error(SWITCH_DIRTY_TREE_MARKER)
+    throw err
+  }
+}
+
+/**
+ * Stash everything (including untracked files), switch, then re-apply the
+ * stash. Used after `checkout()` reports a dirty tree. If re-applying
+ * conflicts, git leaves the stash in place and we throw
+ * SWITCH_AUTOSTASH_CONFLICT_MARKER so the renderer can explain.
+ */
+export async function checkoutAutostash(repoPath: string, branch: string): Promise<void> {
+  const g = git(repoPath)
+  await g.raw(['stash', 'push', '--include-untracked', '-m', 'bonsai: auto-stash before switch'])
+  try {
+    await g.raw(['switch', branch])
+  } catch (err) {
+    // Switch failed for some reason other than dirty tree — undo the stash so
+    // the tree is restored, then rethrow.
+    await g.raw(['stash', 'pop']).catch(() => {})
+    throw err
+  }
+  try {
+    await g.raw(['stash', 'pop'])
+  } catch {
+    throw new Error(SWITCH_AUTOSTASH_CONFLICT_MARKER)
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -106,11 +106,14 @@ export function registerIpc(): void {
   ipcMain.handle('git:checkout', (_e, repoId: string, branch: string) =>
     gitOps.checkout(repoPath(repoId), branch),
   )
-  ipcMain.handle('git:rebaseInProgress', (_e, repoId: string) =>
-    gitOps.isRebaseInProgress(repoPath(repoId)),
+  ipcMain.handle('git:checkoutAutostash', (_e, repoId: string, branch: string) =>
+    gitOps.checkoutAutostash(repoPath(repoId), branch),
   )
-  ipcMain.handle('git:rebaseAbort', (_e, repoId: string) =>
-    gitOps.rebaseAbort(repoPath(repoId)),
+  ipcMain.handle('git:inProgressOp', (_e, repoId: string) =>
+    gitOps.inProgressOperation(repoPath(repoId)),
+  )
+  ipcMain.handle('git:abortInProgressOp', (_e, repoId: string) =>
+    gitOps.abortInProgressOperation(repoPath(repoId)),
   )
   ipcMain.handle('git:createBranch', (_e, repoId: string, name: string, from?: string) =>
     gitOps.createBranch(repoPath(repoId), name, from),

@@ -10,11 +10,46 @@ interface Session {
   proc: pty.IPty
   sender: WebContents
   lastProcess: string
+  // Output coalescing: node-pty emits data in tiny chunks; forwarding each one
+  // as its own IPC message piles up unboundedly if the renderer stalls (focus
+  // loss, GC pause), pinning main-process memory. Buffer briefly and flush.
+  outBuf: string[]
+  outBytes: number
+  outTimer: ReturnType<typeof setTimeout> | null
 }
 
 const sessions = new Map<string, Session>()
 let counter = 0
 let processPoll: ReturnType<typeof setInterval> | null = null
+
+// Small enough that a human doesn't perceive latency; large enough to coalesce
+// hundreds of PTY chunks from a chatty program into one IPC round-trip.
+const OUTPUT_FLUSH_MS = 8
+const OUTPUT_FLUSH_BYTES = 64 * 1024
+
+function flushOutput(s: Session): void {
+  if (s.outTimer) {
+    clearTimeout(s.outTimer)
+    s.outTimer = null
+  }
+  if (s.outBuf.length === 0) return
+  const data = s.outBuf.length === 1 ? s.outBuf[0] : s.outBuf.join('')
+  s.outBuf = []
+  s.outBytes = 0
+  if (!s.sender.isDestroyed()) s.sender.send('session:data', s.id, data)
+}
+
+// Some children (nohup'd tasks, agents that setsid) survive their parent
+// shell's exit and get reparented to init. Belt-and-suspenders: SIGKILL the
+// whole process group so nothing outlives a session.
+function killProcessGroup(pid: number): void {
+  if (process.platform === 'win32' || !pid) return
+  try {
+    process.kill(-pid, 'SIGKILL')
+  } catch {
+    /* group already gone */
+  }
+}
 
 // Poll each PTY's foreground process name (node-pty's `process` reflects the
 // active foreground program — `claude`, `vim`, `node`, the shell when idle).
@@ -65,15 +100,33 @@ export function createSession(opts: SessionOptions, sender: WebContents): string
     } as Record<string, string>,
   })
 
+  const session: Session = {
+    id,
+    proc,
+    sender,
+    lastProcess: '',
+    outBuf: [],
+    outBytes: 0,
+    outTimer: null,
+  }
+  sessions.set(id, session)
+
   proc.onData((data) => {
-    if (!sender.isDestroyed()) sender.send('session:data', id, data)
+    session.outBuf.push(data)
+    session.outBytes += data.length
+    if (session.outBytes >= OUTPUT_FLUSH_BYTES) {
+      flushOutput(session)
+    } else if (!session.outTimer) {
+      session.outTimer = setTimeout(() => flushOutput(session), OUTPUT_FLUSH_MS)
+    }
   })
   proc.onExit(({ exitCode }) => {
+    flushOutput(session)
+    killProcessGroup(proc.pid)
     if (!sender.isDestroyed()) sender.send('session:exit', id, exitCode)
     sessions.delete(id)
   })
 
-  sessions.set(id, { id, proc, sender, lastProcess: '' })
   ensureProcessPoll()
   return id
 }
@@ -90,22 +143,21 @@ export function resizeSession(id: string, cols: number, rows: number): void {
 export function killSession(id: string): void {
   const s = sessions.get(id)
   if (!s) return
+  if (s.outTimer) {
+    clearTimeout(s.outTimer)
+    s.outTimer = null
+  }
+  s.outBuf = []
+  s.outBytes = 0
   const pid = s.proc.pid
   try {
     s.proc.kill()
   } catch {
     /* already gone */
   }
-  // Also kill the whole process group so child processes (dev servers holding
-  // ports, etc.) don't get orphaned. node-pty makes the shell a session leader,
-  // so the negative pid targets the group.
-  if (process.platform !== 'win32' && pid) {
-    try {
-      process.kill(-pid, 'SIGKILL')
-    } catch {
-      /* group already gone */
-    }
-  }
+  // node-pty makes the shell a session leader, so the negative pid targets the
+  // whole group — kills dev servers, background jobs, and detached children.
+  killProcessGroup(pid)
   sessions.delete(id)
 }
 

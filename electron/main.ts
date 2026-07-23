@@ -145,6 +145,10 @@ function createWindow(): void {
       nodeIntegration: false,
       sandbox: false,
       webviewTag: true,
+      // Chromium throttles background frames, which stalls the renderer's IPC
+      // drain when the window loses focus. PTY output would then queue in the
+      // main process unboundedly. Keep the renderer responsive.
+      backgroundThrottling: false,
     },
   })
 

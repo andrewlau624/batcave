@@ -68,6 +68,12 @@ const MAX_TURNS_PER_TAB = 25
 let turnCounter = 0
 const nextTurnId = () => `tn${Date.now()}-${++turnCounter}`
 
+// Minimum interval between "did the branch change under us?" `git status` calls
+// per tab. Without this, a program that flaps busy↔idle rapidly (an agent
+// spawning many short-lived subprocs) triggers a status IPC on every flip.
+const BRANCH_SYNC_MIN_MS = 1000
+const lastBranchSyncByTab = new Map<string, number>()
+
 type Modal =
   | { type: 'newBranch'; repoId: string }
   | { type: 'confirmDelete'; repoId: string; branch: string }
@@ -472,19 +478,53 @@ export const useApp = create<AppState>((set, get) => ({
       void get().refreshStatus()
     } catch (err) {
       const msg = (err as Error).message
-      // Surfaced by electron/git.ts checkout() when the primary checkout is
-      // mid-rebase — offer to abort the rebase and retry the switch.
-      if (msg.startsWith('__BONSAI_REBASE_IN_PROGRESS__:')) {
+      // Surfaced by electron/git.ts checkout() when the primary checkout has
+      // an unfinished rebase/merge/cherry-pick/revert/bisect blocking the
+      // switch — offer to abort it and retry.
+      if (msg.startsWith('__BONSAI_OPERATION_IN_PROGRESS__:')) {
+        const [, op] = msg.split(':')
+        const label =
+          op === 'cherry-pick' ? 'cherry-pick' : op // rebase/merge/revert/bisect are single words
         const ok = confirm(
-          `A rebase is in progress in this repo and is blocking the branch switch.\n\n` +
-            `Abort the rebase (restoring the pre-rebase state) and switch to "${branch}"?`,
+          `A ${label} is in progress in this repo and is blocking the branch switch.\n\n` +
+            `Abort the ${label} (restoring the pre-${label} state) and switch to "${branch}"?`,
         )
         if (ok) {
           try {
-            await window.bonsai.git.rebaseAbort(repoId)
+            await window.bonsai.git.abortInProgressOp(repoId)
             await get().checkoutBranch(repoId, branch)
           } catch (e) {
-            alert(`Could not abort rebase:\n${(e as Error).message}`)
+            alert(`Could not abort ${label}:\n${(e as Error).message}`)
+          }
+        }
+        return
+      }
+      // Surfaced when local changes would be overwritten by the switch — offer
+      // to stash everything (incl. untracked), switch, then re-apply on top.
+      if (msg === '__BONSAI_SWITCH_DIRTY_TREE__') {
+        const ok = confirm(
+          `Can't switch: your local changes (or new untracked files) would be overwritten ` +
+            `by "${branch}".\n\n` +
+            `Stash everything (including untracked files), switch, then re-apply your changes on top?`,
+        )
+        if (ok) {
+          try {
+            await window.bonsai.git.checkoutAutostash(repoId, branch)
+            // Refresh downstream state — the switch actually happened.
+            await get().reloadBranches(repoId)
+            void get().refreshStatus()
+          } catch (e) {
+            const m = (e as Error).message
+            if (m === '__BONSAI_SWITCH_AUTOSTASH_CONFLICT__') {
+              alert(
+                `Switched to "${branch}", but your stashed local changes couldn't be re-applied ` +
+                  `cleanly (they overlap with what's on the new branch).\n\n` +
+                  `Nothing was lost — your work is preserved in the stash. Reconcile it from a ` +
+                  `terminal with "git stash list" then "git stash pop" / "git stash drop".`,
+              )
+            } else {
+              alert(`Could not switch to ${branch}:\n${m}`)
+            }
           }
         }
         return
@@ -648,6 +688,7 @@ export const useApp = create<AppState>((set, get) => ({
       return
     }
     window.bonsai.session.kill(id)
+    lastBranchSyncByTab.delete(id)
     set((s) => {
       const closing = s.tabs.find((t) => t.id === id)
       const tabs = s.tabs.filter((t) => t.id !== id)
@@ -744,10 +785,16 @@ export const useApp = create<AppState>((set, get) => ({
     if (wasBusy && !isBusy) {
       // A just-finished command may have switched branches — re-check this tab's
       // HEAD and relabel it if it drifted, even when it isn't the active tab.
-      void window.bonsai.git
-        .status(tab.cwd)
-        .then((st) => get().syncBranchFromStatus(id, st.branch))
-        .catch(() => {})
+      // Throttled per tab to survive rapid busy↔idle flapping.
+      const now = Date.now()
+      const last = lastBranchSyncByTab.get(id) ?? 0
+      if (now - last >= BRANCH_SYNC_MIN_MS) {
+        lastBranchSyncByTab.set(id, now)
+        void window.bonsai.git
+          .status(tab.cwd)
+          .then((st) => get().syncBranchFromStatus(id, st.branch))
+          .catch(() => {})
+      }
 
       const list = get().turnsByTab[id] ?? []
       const open = list.find((t) => !t.endedAt)

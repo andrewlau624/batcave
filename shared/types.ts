@@ -1,5 +1,8 @@
 // Types shared between the Electron main process and the React renderer.
 
+/** Any git operation that leaves state under `.git/` and blocks `git switch`. */
+export type InProgressOp = 'rebase' | 'merge' | 'cherry-pick' | 'revert' | 'bisect'
+
 export interface Repo {
   id: string
   name: string
@@ -302,10 +305,12 @@ export interface BonsaiApi {
     fetch(repoId: string): Promise<void>
     /** Switch the primary checkout's HEAD to `branch` (git switch). */
     checkout(repoId: string, branch: string): Promise<void>
-    /** True if the primary checkout is mid-rebase (.git/rebase-merge or rebase-apply). */
-    rebaseInProgress(repoId: string): Promise<boolean>
-    /** Abort an in-progress rebase, restoring the original HEAD. */
-    rebaseAbort(repoId: string): Promise<void>
+    /** Stash (incl. untracked), switch, then re-apply — used after a dirty-tree switch refusal. */
+    checkoutAutostash(repoId: string, branch: string): Promise<void>
+    /** Which in-progress operation (if any) is blocking `git switch`. */
+    inProgressOp(repoId: string): Promise<InProgressOp | null>
+    /** Abort whatever operation is in progress, restoring HEAD. */
+    abortInProgressOp(repoId: string): Promise<void>
     createBranch(repoId: string, name: string, from?: string): Promise<void>
     deleteBranch(repoId: string, name: string, force?: boolean): Promise<void>
     diffFile(cwd: string, file: string, staged: boolean): Promise<string>

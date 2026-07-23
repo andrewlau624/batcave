@@ -41,9 +41,14 @@ const api: BonsaiApi = {
     fetch: (repoId) => ipcRenderer.invoke('git:fetch', repoId) as Promise<void>,
     checkout: (repoId, branch) =>
       ipcRenderer.invoke('git:checkout', repoId, branch) as Promise<void>,
-    rebaseInProgress: (repoId) =>
-      ipcRenderer.invoke('git:rebaseInProgress', repoId) as Promise<boolean>,
-    rebaseAbort: (repoId) => ipcRenderer.invoke('git:rebaseAbort', repoId) as Promise<void>,
+    checkoutAutostash: (repoId, branch) =>
+      ipcRenderer.invoke('git:checkoutAutostash', repoId, branch) as Promise<void>,
+    inProgressOp: (repoId) =>
+      ipcRenderer.invoke('git:inProgressOp', repoId) as Promise<
+        import('../shared/types').InProgressOp | null
+      >,
+    abortInProgressOp: (repoId) =>
+      ipcRenderer.invoke('git:abortInProgressOp', repoId) as Promise<void>,
     createBranch: (repoId, name, from) =>
       ipcRenderer.invoke('git:createBranch', repoId, name, from) as Promise<void>,
     deleteBranch: (repoId, name, force) =>
