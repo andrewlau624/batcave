@@ -65,6 +65,8 @@ export type DrawerPanel = 'changes' | 'files' | 'prs' | 'log' | 'turns'
 
 /** Max turns retained per tab. Older ones drop off the end (LRU by start time). */
 const MAX_TURNS_PER_TAB = 25
+/** Max cached turn diffs across all tabs. Diffs can be large; FIFO-evict oldest. */
+const MAX_TURN_DIFF_CACHE = 12
 let turnCounter = 0
 const nextTurnId = () => `tn${Date.now()}-${++turnCounter}`
 
@@ -695,6 +697,8 @@ export const useApp = create<AppState>((set, get) => ({
       const processByTab = { ...s.processByTab }
       delete processByTab[id]
       const turnsByTab = { ...s.turnsByTab }
+      const turnDiffById = { ...s.turnDiffById }
+      for (const t of turnsByTab[id] ?? []) delete turnDiffById[t.id]
       delete turnsByTab[id]
       let activeTabId = s.activeTabId
       if (s.activeTabId === id) {
@@ -703,7 +707,7 @@ export const useApp = create<AppState>((set, get) => ({
         const sameRepo = tabs.filter((t) => closing && t.repoId === closing.repoId)
         activeTabId = sameRepo[sameRepo.length - 1]?.id ?? null
       }
-      return { tabs, activeTabId, processByTab, turnsByTab }
+      return { tabs, activeTabId, processByTab, turnsByTab, turnDiffById }
     })
     get().persist()
     void get().refreshStatus()
@@ -833,7 +837,16 @@ export const useApp = create<AppState>((set, get) => ({
       turn.preRef,
       turn.postRef ?? '',
     )
-    set((s) => ({ turnDiffById: { ...s.turnDiffById, [turnId]: text } }))
+    set((s) => {
+      // FIFO evict the oldest cached diff once we're over the cap. Prevents
+      // this cache from being a slow leak across a long session.
+      const next: Record<string, string> = { ...s.turnDiffById, [turnId]: text }
+      const keys = Object.keys(next)
+      if (keys.length > MAX_TURN_DIFF_CACHE) {
+        for (let i = 0; i < keys.length - MAX_TURN_DIFF_CACHE; i++) delete next[keys[i]]
+      }
+      return { turnDiffById: next }
+    })
   },
 
   // Manual "end turn now" — useful when an AI runs inside a long-lived process

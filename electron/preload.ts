@@ -81,6 +81,7 @@ const api: BonsaiApi = {
     write: (id, data) => ipcRenderer.send('session:write', id, data),
     resize: (id, cols, rows) => ipcRenderer.send('session:resize', id, cols, rows),
     kill: (id) => ipcRenderer.send('session:kill', id),
+    ack: (id, bytes) => ipcRenderer.send('session:ack', id, bytes),
     onData: (cb) => {
       const listener = (_e: unknown, id: string, data: string) => cb(id, data)
       ipcRenderer.on('session:data', listener)

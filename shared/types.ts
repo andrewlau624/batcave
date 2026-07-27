@@ -333,6 +333,8 @@ export interface BonsaiApi {
     write(id: string, data: string): void
     resize(id: string, cols: number, rows: number): void
     kill(id: string): void
+    /** Back-pressure ack: tell main how many bytes of PTY output xterm just consumed. */
+    ack(id: string, bytes: number): void
     onData(cb: (id: string, data: string) => void): () => void
     onExit(cb: (id: string, code: number) => void): () => void
     /** Fires when a session's foreground process name changes (for tab titles / busy state). */

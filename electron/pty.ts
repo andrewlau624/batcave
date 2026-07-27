@@ -16,6 +16,13 @@ interface Session {
   outBuf: string[]
   outBytes: number
   outTimer: ReturnType<typeof setTimeout> | null
+  // Back-pressure: bytes sent to the renderer but not yet acked (xterm has not
+  // finished consuming them). When this exceeds MAX_INFLIGHT_BYTES we stop
+  // buffering new PTY output and count it as dropped instead — otherwise a
+  // program that dumps GBs (agent output, `cat` on a huge file, tail -f on a
+  // busy log) balloons main-process RAM into the tens of GB.
+  inFlightBytes: number
+  droppedBytes: number
 }
 
 const sessions = new Map<string, Session>()
@@ -26,6 +33,10 @@ let processPoll: ReturnType<typeof setInterval> | null = null
 // hundreds of PTY chunks from a chatty program into one IPC round-trip.
 const OUTPUT_FLUSH_MS = 8
 const OUTPUT_FLUSH_BYTES = 64 * 1024
+// Hard cap on unacked bytes. Above this, incoming PTY output is dropped (with
+// a visible marker inserted when flow resumes) so main-process RAM stays
+// bounded even against an indefinitely slow / stalled renderer.
+const MAX_INFLIGHT_BYTES = 8 * 1024 * 1024
 
 function flushOutput(s: Session): void {
   if (s.outTimer) {
@@ -36,7 +47,9 @@ function flushOutput(s: Session): void {
   const data = s.outBuf.length === 1 ? s.outBuf[0] : s.outBuf.join('')
   s.outBuf = []
   s.outBytes = 0
-  if (!s.sender.isDestroyed()) s.sender.send('session:data', s.id, data)
+  if (s.sender.isDestroyed()) return
+  s.inFlightBytes += data.length
+  s.sender.send('session:data', s.id, data)
 }
 
 // Some children (nohup'd tasks, agents that setsid) survive their parent
@@ -108,10 +121,27 @@ export function createSession(opts: SessionOptions, sender: WebContents): string
     outBuf: [],
     outBytes: 0,
     outTimer: null,
+    inFlightBytes: 0,
+    droppedBytes: 0,
   }
   sessions.set(id, session)
 
   proc.onData((data) => {
+    // If the renderer is falling behind (too many unacked bytes in flight),
+    // drop new PTY output rather than growing an unbounded queue in main.
+    if (session.inFlightBytes + session.outBytes + data.length > MAX_INFLIGHT_BYTES) {
+      session.droppedBytes += data.length
+      return
+    }
+    // First arrival after a drop period: mark the gap so the user knows why
+    // their output has a hole in it.
+    if (session.droppedBytes > 0) {
+      const marker =
+        `\r\n\x1b[33m[bonsai: ${session.droppedBytes} bytes elided — renderer was falling behind]\x1b[0m\r\n`
+      session.droppedBytes = 0
+      session.outBuf.push(marker)
+      session.outBytes += marker.length
+    }
     session.outBuf.push(data)
     session.outBytes += data.length
     if (session.outBytes >= OUTPUT_FLUSH_BYTES) {
@@ -135,6 +165,14 @@ export function writeSession(id: string, data: string): void {
   sessions.get(id)?.proc.write(data)
 }
 
+// Renderer reports that xterm finished consuming `bytes` of PTY output — the
+// back-pressure signal that keeps main-process memory bounded. See MAX_INFLIGHT_BYTES.
+export function ackSessionBytes(id: string, bytes: number): void {
+  const s = sessions.get(id)
+  if (!s) return
+  s.inFlightBytes = Math.max(0, s.inFlightBytes - bytes)
+}
+
 export function resizeSession(id: string, cols: number, rows: number): void {
   const s = sessions.get(id)
   if (s && cols > 0 && rows > 0) s.proc.resize(cols, rows)
@@ -149,6 +187,8 @@ export function killSession(id: string): void {
   }
   s.outBuf = []
   s.outBytes = 0
+  s.inFlightBytes = 0
+  s.droppedBytes = 0
   const pid = s.proc.pid
   try {
     s.proc.kill()

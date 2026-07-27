@@ -58,6 +58,9 @@ export function TerminalView({ tab, active }: { tab: TabState; active: boolean }
       cursorBlink,
       cursorStyle,
       allowProposedApi: true,
+      // Bound each tab's retained history. Default is 1000; 2000 gives useful
+      // scrollback while keeping per-tab memory small when many tabs pile up.
+      scrollback: 2000,
       theme: termTheme,
     })
     const fit = new FitAddon()
@@ -119,7 +122,12 @@ export function TerminalView({ tab, active }: { tab: TabState; active: boolean }
       registerSession(tab.id, id)
       offData = window.bonsai.session.onData((sid, data) => {
         if (sid !== id) return
-        term.write(data)
+        // xterm's write callback fires only after the internal parser has
+        // consumed the chunk — the accurate back-pressure signal for main.
+        // Without this ack, main can't bound its in-flight IPC queue and a
+        // chatty program (agent output, tail -f, cat big-file) can balloon
+        // RAM to tens of GB when the renderer stalls.
+        term.write(data, () => window.bonsai.session.ack(id, data.length))
         const matches = data.match(LOCAL_URL_RE)
         if (matches) for (const url of matches) useApp.getState().detectPreviewUrl(url)
       })

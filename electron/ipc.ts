@@ -152,6 +152,7 @@ export function registerIpc(): void {
     ptyMgr.resizeSession(id, cols, rows),
   )
   ipcMain.on('session:kill', (_e, id: string) => ptyMgr.killSession(id))
+  ipcMain.on('session:ack', (_e, id: string, bytes: number) => ptyMgr.ackSessionBytes(id, bytes))
 
   // ---- Layout persistence ----
   ipcMain.handle('layout:load', () => store.getLayout())
