@@ -700,6 +700,13 @@ export const useApp = create<AppState>((set, get) => ({
       const turnDiffById = { ...s.turnDiffById }
       for (const t of turnsByTab[id] ?? []) delete turnDiffById[t.id]
       delete turnsByTab[id]
+      // Drop cached git status if this was the last tab in that worktree —
+      // otherwise statusByCwd grows unbounded over a long session as the user
+      // opens and closes many branches.
+      const statusByCwd = { ...s.statusByCwd }
+      if (closing && !tabs.some((t) => t.cwd === closing.cwd)) {
+        delete statusByCwd[closing.cwd]
+      }
       let activeTabId = s.activeTabId
       if (s.activeTabId === id) {
         // Prefer the next tab in the SAME repo. If none, leave activeTabId null
@@ -707,7 +714,7 @@ export const useApp = create<AppState>((set, get) => ({
         const sameRepo = tabs.filter((t) => closing && t.repoId === closing.repoId)
         activeTabId = sameRepo[sameRepo.length - 1]?.id ?? null
       }
-      return { tabs, activeTabId, processByTab, turnsByTab, turnDiffById }
+      return { tabs, activeTabId, processByTab, turnsByTab, turnDiffById, statusByCwd }
     })
     get().persist()
     void get().refreshStatus()

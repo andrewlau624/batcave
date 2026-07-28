@@ -335,7 +335,12 @@ export interface BonsaiApi {
     kill(id: string): void
     /** Back-pressure ack: tell main how many bytes of PTY output xterm just consumed. */
     ack(id: string, bytes: number): void
-    onData(cb: (id: string, data: string) => void): () => void
+    /**
+     * Subscribe to PTY output for a specific session. Main sends on
+     * `session:data:<id>` so only the owning TerminalView receives it —
+     * avoids N× broadcast traffic when many tabs are open.
+     */
+    onData(id: string, cb: (id: string, data: string) => void): () => void
     onExit(cb: (id: string, code: number) => void): () => void
     /** Fires when a session's foreground process name changes (for tab titles / busy state). */
     onProcess(cb: (id: string, name: string) => void): () => void

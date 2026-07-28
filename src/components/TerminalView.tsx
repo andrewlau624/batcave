@@ -58,9 +58,10 @@ export function TerminalView({ tab, active }: { tab: TabState; active: boolean }
       cursorBlink,
       cursorStyle,
       allowProposedApi: true,
-      // Bound each tab's retained history. Default is 1000; 2000 gives useful
-      // scrollback while keeping per-tab memory small when many tabs pile up.
-      scrollback: 2000,
+      // Bound each tab's retained history. Default 2000 lines × many open tabs
+      // was a major source of renderer RAM runaway. 500 keeps useful context
+      // while bounding per-tab memory when dozens of tabs accumulate.
+      scrollback: 500,
       theme: termTheme,
     })
     const fit = new FitAddon()
@@ -120,14 +121,21 @@ export function TerminalView({ tab, active }: { tab: TabState; active: boolean }
       }
       sessionIdRef.current = id
       registerSession(tab.id, id)
-      offData = window.bonsai.session.onData((sid, data) => {
-        if (sid !== id) return
-        // xterm's write callback fires only after the internal parser has
-        // consumed the chunk — the accurate back-pressure signal for main.
-        // Without this ack, main can't bound its in-flight IPC queue and a
-        // chatty program (agent output, tail -f, cat big-file) can balloon
-        // RAM to tens of GB when the renderer stalls.
-        term.write(data, () => window.bonsai.session.ack(id, data.length))
+      offData = window.bonsai.session.onData(id, (_sid, data) => {
+        // xterm's write callback fires after the internal parser consumes the
+        // chunk — but parsing is fast and synchronous-ish. The slow path is
+        // painting. Acking on the parse callback lets main refill its
+        // in-flight budget before the GPU has caught up, so the back-pressure
+        // signal never trips even when the renderer is genuinely falling
+        // behind on paint. Defer the ack to the next animation frame: by
+        // then the frame has either painted or dropped, and main learns the
+        // real drain rate.
+        const bytes = data.length
+        term.write(data)
+        requestAnimationFrame(() => {
+          if (disposed) return
+          window.bonsai.session.ack(id, bytes)
+        })
         const matches = data.match(LOCAL_URL_RE)
         if (matches) for (const url of matches) useApp.getState().detectPreviewUrl(url)
       })

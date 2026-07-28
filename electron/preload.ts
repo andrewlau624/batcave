@@ -82,10 +82,14 @@ const api: BonsaiApi = {
     resize: (id, cols, rows) => ipcRenderer.send('session:resize', id, cols, rows),
     kill: (id) => ipcRenderer.send('session:kill', id),
     ack: (id, bytes) => ipcRenderer.send('session:ack', id, bytes),
-    onData: (cb) => {
-      const listener = (_e: unknown, id: string, data: string) => cb(id, data)
-      ipcRenderer.on('session:data', listener)
-      return () => ipcRenderer.removeListener('session:data', listener)
+    onData: (id, cb) => {
+      // Per-session channel: main sends `session:data:<id>` only to the
+      // TerminalView that owns this session, avoiding N× broadcast traffic
+      // when many tabs are open.
+      const channel = `session:data:${id}`
+      const listener = (_e: unknown, data: string) => cb(id, data)
+      ipcRenderer.on(channel, listener)
+      return () => ipcRenderer.removeListener(channel, listener)
     },
     onExit: (cb) => {
       const listener = (_e: unknown, id: string, code: number) => cb(id, code)

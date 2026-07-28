@@ -49,7 +49,11 @@ function flushOutput(s: Session): void {
   s.outBytes = 0
   if (s.sender.isDestroyed()) return
   s.inFlightBytes += data.length
-  s.sender.send('session:data', s.id, data)
+  // Per-session channel: only the TerminalView that owns this session listens
+  // to `session:data:<id>`. The prior broadcast (`session:data`) was delivered
+  // to every TerminalView in the window, each of which filtered by id — N×
+  // IPC traffic that the renderer dropped, but main still paid for.
+  s.sender.send(`session:data:${s.id}`, data)
 }
 
 // Some children (nohup'd tasks, agents that setsid) survive their parent
