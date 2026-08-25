@@ -1062,7 +1062,21 @@ async fn do_create_worktree(
         .map(|(repo, path, _)| (repo.clone(), path.clone()))
         .collect();
 
-    let created_paths = await_and_rollback_on_failure(creation_infos, fs, cx).await?;
+    let created_paths = await_and_rollback_on_failure(creation_infos, fs.clone(), cx).await?;
+
+    // Carry `.env*` files from each primary checkout into the new worktrees
+    // so gitignored secrets are available immediately. Failures are logged,
+    // not fatal: a missing link must not block opening the workspace.
+    if remote_connection_options.is_none() {
+        for path in &created_paths {
+            if let Err(error) = crate::env_vault::carry_env_files(fs.clone(), path.clone()).await {
+                log::warn!(
+                    "Failed to carry .env files into new worktree {}: {error}",
+                    path.display()
+                );
+            }
+        }
+    }
 
     // Record each created worktree so thread archival can later verify that
     // Zed created it before deleting it from disk. Failures are non-fatal:
@@ -1118,6 +1132,20 @@ async fn do_switch_worktree(
     remote_connection_options: Option<RemoteConnectionOptions>,
     cx: &mut AsyncWindowContext,
 ) -> anyhow::Result<Entity<Workspace>> {
+    if remote_connection_options.is_none() {
+        let fs = cx.update(|_, cx| <dyn Fs>::global(cx))?;
+        // Switching to a worktree created outside Zed may also be missing its
+        // env links; carrying is idempotent, existing files win.
+        if let Err(error) =
+            crate::env_vault::carry_env_files(fs, worktree_path.clone()).await
+        {
+            log::warn!(
+                "Failed to carry .env files into worktree {}: {error}",
+                worktree_path.display()
+            );
+        }
+    }
+
     let path_remapping: Vec<(PathBuf, PathBuf)> = git_repo_work_dirs
         .iter()
         .map(|work_dir| (work_dir.clone(), worktree_path.clone()))

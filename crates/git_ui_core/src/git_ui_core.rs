@@ -9,6 +9,7 @@ use workspace::Workspace;
 
 pub mod askpass_modal;
 pub mod created_worktrees;
+pub mod env_vault;
 pub mod file_diff_view;
 pub mod notifications;
 pub mod worktree_names;
