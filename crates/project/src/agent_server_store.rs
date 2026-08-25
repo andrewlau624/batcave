@@ -1689,7 +1689,24 @@ mod tests {
     #[cfg(feature = "test-support")]
     use http_client::{AsyncBody, FakeHttpClient, Response};
     use node_runtime::NodeRuntime;
+    use settings::RootUserSettings as _;
     use settings::Settings as _;
+
+    #[test]
+    fn test_default_settings_include_opencode() {
+        let parsed = settings::UserSettingsContent::parse_json_with_comments(
+            settings::default_settings().as_ref(),
+        )
+        .unwrap();
+        let all = AllAgentServersSettings::from_settings(&parsed.content);
+        match all.get("OpenCode").expect("OpenCode default agent server") {
+            CustomAgentServerSettings::Custom { command, .. } => {
+                assert_eq!(command.path, std::path::Path::new("opencode"));
+                assert_eq!(command.args, ["acp"]);
+            }
+            other => panic!("expected custom agent server, got {other:?}"),
+        }
+    }
 
     #[cfg(feature = "test-support")]
     const TEST_ARCHIVE_URL: &str = "https://example.test/agent";
