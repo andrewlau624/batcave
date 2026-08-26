@@ -359,7 +359,7 @@ pub fn classify_worktrees(
 /// Returns `None` for `CurrentBranch`, meaning "use the current HEAD".
 pub fn resolve_worktree_branch_target(branch_target: &NewWorktreeBranchTarget) -> Option<String> {
     match branch_target {
-        NewWorktreeBranchTarget::CurrentBranch => None,
+        NewWorktreeBranchTarget::CurrentBranch | NewWorktreeBranchTarget::NewBranch { .. } => None,
         NewWorktreeBranchTarget::ExistingBranch { name } => Some(name.clone()),
         NewWorktreeBranchTarget::RemoteBranch {
             remote_name,
@@ -374,9 +374,9 @@ fn remote_branch_to_fetch(branch_target: &NewWorktreeBranchTarget) -> Option<(&s
             remote_name,
             branch_name,
         } => Some((remote_name, branch_name)),
-        NewWorktreeBranchTarget::CurrentBranch | NewWorktreeBranchTarget::ExistingBranch { .. } => {
-            None
-        }
+        NewWorktreeBranchTarget::CurrentBranch
+        | NewWorktreeBranchTarget::ExistingBranch { .. }
+        | NewWorktreeBranchTarget::NewBranch { .. } => None,
     }
 }
 
@@ -467,6 +467,7 @@ fn start_worktree_creations(
     existing_worktree_names: &[String],
     existing_worktree_paths: &HashSet<PathBuf>,
     base_ref: Option<String>,
+    new_branch_name: Option<String>,
     worktree_directory_setting: &str,
     rng: &mut impl rand::Rng,
     cx: &mut gpui::App,
@@ -502,8 +503,14 @@ fn start_worktree_creations(
             let receiver = if scheduled_paths.contains(&new_path) {
                 None
             } else {
-                let target = git::repository::CreateWorktreeTarget::Detached {
-                    base_sha: base_ref.clone(),
+                let target = match &new_branch_name {
+                    Some(branch_name) => git::repository::CreateWorktreeTarget::NewBranch {
+                        branch_name: branch_name.clone(),
+                        base_sha: None,
+                    },
+                    None => git::repository::CreateWorktreeTarget::Detached {
+                        base_sha: base_ref.clone(),
+                    },
                 };
                 Some(repo.create_worktree(target, new_path.clone()))
             };
@@ -1060,6 +1067,10 @@ async fn do_create_worktree(
     let mut rng = rand::rng();
 
     let base_ref = resolve_worktree_branch_target(&branch_target);
+    let new_branch_name = match &branch_target {
+        NewWorktreeBranchTarget::NewBranch { name } => Some(name.clone()),
+        _ => None,
+    };
 
     let (creation_infos, path_remapping) = cx.update(|_, cx| {
         start_worktree_creations(
@@ -1068,6 +1079,7 @@ async fn do_create_worktree(
             &existing_worktree_names,
             &existing_worktree_paths,
             base_ref,
+            new_branch_name,
             &worktree_directory_setting,
             &mut rng,
             cx,

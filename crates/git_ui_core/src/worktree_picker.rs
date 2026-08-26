@@ -5,7 +5,7 @@ use anyhow::Context as _;
 use collections::HashSet;
 use fuzzy::StringMatchCandidate;
 use futures::StreamExt as _;
-use git::repository::{Worktree as GitWorktree, parse_worktrees_from_str};
+use git::repository::{Branch, Worktree as GitWorktree, parse_worktrees_from_str};
 use fs::Fs;
 use gpui::{
     Action, AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
@@ -142,6 +142,7 @@ impl WorktreePicker {
             workspace,
             focused_dock,
             target_repository,
+            repository: repository.clone(),
             current_branch_name,
             default_branch: None,
             has_multiple_repositories,
@@ -337,6 +338,41 @@ enum WorktreeEntry {
         from_branch: Option<RemoteBranchName>,
         disabled_reason: Option<String>,
     },
+    CreateFromGitHubLink {
+        branch: SharedString,
+        existing_path: Option<PathBuf>,
+    },
+    CreateFromExistingBranch {
+        branch_name: SharedString,
+    },
+    CreateNewBranch {
+        name: SharedString,
+    },
+}
+
+/// Extracts the branch name from a GitHub-style branch link like
+/// `https://github.com/owner/repo/tree/branch/name`. Returns `None` for
+/// anything that isn't a `tree/` link (PRs, issues, plain repo URLs).
+fn github_link_branch(query: &str) -> Option<String> {
+    let query = query.trim();
+    let (_, rest) = query.split_once("://")?;
+    let (_, path) = rest.split_once('/')?;
+    let mut segments = path.split('/').filter(|segment| !segment.is_empty());
+    segments.next()?; // owner
+    segments.next()?; // repo
+    if segments.next()? != "tree" {
+        return None;
+    }
+    let branch = segments.collect::<Vec<_>>().join("/");
+    let branch = branch
+        .split_once('?')
+        .map(|(branch, _)| branch)
+        .unwrap_or(&branch);
+    let branch = branch
+        .split_once('#')
+        .map(|(branch, _)| branch)
+        .unwrap_or(branch);
+    (!branch.is_empty()).then(|| branch.to_string())
 }
 
 /// A repository that is not part of the current project, discovered by
@@ -358,6 +394,7 @@ struct WorktreePickerDelegate {
     workspace: WeakEntity<Workspace>,
     focused_dock: Option<DockPosition>,
     target_repository: Option<Entity<Repository>>,
+    repository: Option<Entity<Repository>>,
     current_branch_name: Option<String>,
     default_branch: Option<RemoteBranchName>,
     has_multiple_repositories: bool,
@@ -948,6 +985,25 @@ impl PickerDelegate for WorktreePickerDelegate {
             return Task::ready(());
         }
 
+        // A pasted GitHub branch link jumps straight to that branch: switch to
+        // an existing worktree on it, or create a new one.
+        if let Some(branch) = github_link_branch(&query) {
+            let branch = SharedString::from(branch);
+            let existing_path = self
+                .all_repo_worktrees()
+                .iter()
+                .find(|worktree| {
+                    worktree.branch_name().map(|name| name.to_string()) == Some(branch.to_string())
+                })
+                .map(|worktree| worktree.path.clone());
+            self.matches = vec![WorktreeEntry::CreateFromGitHubLink {
+                branch,
+                existing_path,
+            }];
+            self.sync_selected_index(true);
+            return Task::ready(());
+        }
+
         let main_worktree_path = repo_worktrees
             .iter()
             .find(|wt| wt.is_main)
@@ -977,6 +1033,7 @@ impl PickerDelegate for WorktreePickerDelegate {
         }
 
         let executor = cx.background_executor().clone();
+        let query_for_branches = query.clone();
 
         let task = cx.background_executor().spawn(async move {
             fuzzy::match_strings(
@@ -992,6 +1049,15 @@ impl PickerDelegate for WorktreePickerDelegate {
         });
 
         let candidate_worktrees_clone = candidate_worktrees;
+        let branches = self.repository.as_ref().map(|repository| {
+            repository
+                .read(cx)
+                .branch_list
+                .iter()
+                .filter(|branch| branch.ref_name.starts_with("refs/heads/"))
+                .cloned()
+                .collect::<Vec<_>>()
+        });
         cx.spawn_in(window, async move |picker, cx| {
             let fuzzy_matches = task.await;
 
@@ -1009,9 +1075,38 @@ impl PickerDelegate for WorktreePickerDelegate {
                         });
                     }
 
-                    if !new_matches.is_empty() {
-                        new_matches.push(WorktreeEntry::Separator);
+                    if let Some(branches) = &branches {
+                        let normalized = query_for_branches.to_lowercase();
+                        let mut matched_branches: Vec<Branch> = branches
+                            .iter()
+                            .filter(|branch| branch.name().to_lowercase().contains(&normalized))
+                            .cloned()
+                            .collect();
+                        matched_branches.sort_by_key(|branch| {
+                            let name = branch.name().to_lowercase();
+                            if name == normalized {
+                                0
+                            } else if name.starts_with(&normalized) {
+                                1
+                            } else {
+                                2
+                            }
+                        });
+                        matched_branches.truncate(5);
+                        for branch in matched_branches {
+                            new_matches.push(WorktreeEntry::CreateFromExistingBranch {
+                                branch_name: branch.name().into(),
+                            });
+                        }
+                        if !new_matches.is_empty() {
+                            new_matches.push(WorktreeEntry::Separator);
+                        }
                     }
+
+                    new_matches.push(WorktreeEntry::CreateNewBranch {
+                        name: normalized_query.clone().into(),
+                    });
+
                     if show_default_branch_create {
                         if let Some(ref default_branch) = default_branch {
                             new_matches.push(WorktreeEntry::CreateNamed {
@@ -1077,6 +1172,89 @@ impl PickerDelegate for WorktreePickerDelegate {
                                 branch_target: NewWorktreeBranchTarget::RemoteBranch {
                                     remote_name: default_branch.remote_name.clone(),
                                     branch_name: default_branch.branch_name.clone(),
+                                },
+                            },
+                            window,
+                            self.focused_dock,
+                            self.target_repository.clone(),
+                            cx,
+                        );
+                    });
+                }
+            }
+            WorktreeEntry::CreateFromGitHubLink {
+                branch,
+                existing_path,
+            } => {
+                let Some(workspace) = self.workspace.upgrade() else {
+                    return;
+                };
+                if let Some(path) = existing_path {
+                    workspace.update(cx, |workspace, cx| {
+                        crate::worktree_service::handle_switch_worktree(
+                            workspace,
+                            &SwitchWorktree {
+                                path: path.clone(),
+                                display_name: branch.to_string(),
+                            },
+                            window,
+                            self.focused_dock,
+                            cx,
+                        );
+                    });
+                } else if self.creation_blocked_reason(cx).is_none() {
+                    workspace.update(cx, |workspace, cx| {
+                        crate::worktree_service::handle_create_worktree(
+                            workspace,
+                            &CreateWorktree {
+                                worktree_name: None,
+                                branch_target: NewWorktreeBranchTarget::RemoteBranch {
+                                    remote_name: "origin".to_string(),
+                                    branch_name: branch.to_string(),
+                                },
+                            },
+                            window,
+                            self.focused_dock,
+                            self.target_repository.clone(),
+                            cx,
+                        );
+                    });
+                }
+            }
+            WorktreeEntry::CreateFromExistingBranch { branch_name } => {
+                if self.creation_blocked_reason(cx).is_some() {
+                    return;
+                }
+                if let Some(workspace) = self.workspace.upgrade() {
+                    workspace.update(cx, |workspace, cx| {
+                        crate::worktree_service::handle_create_worktree(
+                            workspace,
+                            &CreateWorktree {
+                                worktree_name: None,
+                                branch_target: NewWorktreeBranchTarget::ExistingBranch {
+                                    name: branch_name.to_string(),
+                                },
+                            },
+                            window,
+                            self.focused_dock,
+                            self.target_repository.clone(),
+                            cx,
+                        );
+                    });
+                }
+            }
+            WorktreeEntry::CreateNewBranch { name } => {
+                if self.creation_blocked_reason(cx).is_some() {
+                    return;
+                }
+                if let Some(workspace) = self.workspace.upgrade() {
+                    workspace.update(cx, |workspace, cx| {
+                        crate::worktree_service::handle_create_worktree(
+                            workspace,
+                            &CreateWorktree {
+                                worktree_name: Some(name.replace('/', "-")),
+                                branch_target: NewWorktreeBranchTarget::NewBranch {
+                                    name: name.to_string(),
                                 },
                             },
                             window,
@@ -1230,6 +1408,45 @@ impl PickerDelegate for WorktreePickerDelegate {
                     selected,
                 );
 
+                Some(item.into_any_element())
+            }
+            WorktreeEntry::CreateFromGitHubLink {
+                branch,
+                existing_path,
+            } => {
+                let label = match existing_path {
+                    Some(path) => format!(
+                        "Open branch {branch} in {}",
+                        path.compact().to_string_lossy()
+                    ),
+                    None => format!("Open branch {branch} in a new worktree"),
+                };
+                let item = create_new_list_item(
+                    "create-from-github-link".to_string().into(),
+                    label.into(),
+                    None,
+                    selected,
+                );
+                Some(item.into_any_element())
+            }
+            WorktreeEntry::CreateFromExistingBranch { branch_name } => {
+                let label = format!("Open branch {branch_name} in a new worktree");
+                let item = create_new_list_item(
+                    "create-from-existing-branch".to_string().into(),
+                    label.into(),
+                    self.creation_blocked_reason(cx),
+                    selected,
+                );
+                Some(item.into_any_element())
+            }
+            WorktreeEntry::CreateNewBranch { name } => {
+                let label = format!("Create new branch {name} and open in a new worktree");
+                let item = create_new_list_item(
+                    "create-new-branch".to_string().into(),
+                    label.into(),
+                    self.creation_blocked_reason(cx),
+                    selected,
+                );
                 Some(item.into_any_element())
             }
             WorktreeEntry::Worktree {

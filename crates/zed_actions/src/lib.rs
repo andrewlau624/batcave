@@ -311,6 +311,8 @@ pub enum NewWorktreeBranchTarget {
         remote_name: String,
         branch_name: String,
     },
+    /// Create a detached worktree with a newly created branch checked out.
+    NewBranch { name: String },
 }
 
 /// Creates a new git worktree and switches the workspace to it.
