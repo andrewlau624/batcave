@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Build Batcave and install it into /Applications, then launch it.
+
+exec ./script/bundle-mac -i -o "$@"
