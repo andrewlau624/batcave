@@ -2494,8 +2494,18 @@ impl Sidebar {
                     .iter()
                     .filter_map(|workspace| {
                         let root = workspace.read(cx).root_paths(cx).into_iter().next()?;
+                        // The workspace's root matches a repository's working
+                        // directory, its main checkout, or one of its linked
+                        // worktrees. The latter is what lets every open worktree
+                        // of a repo surface as a row, since all workspaces of a
+                        // repo share one project group keyed on the main path.
                         let (_, snapshot) = repositories.iter().find(|(_, snapshot)| {
                             snapshot.work_directory_abs_path.as_ref() == root.as_ref()
+                                || snapshot.main_worktree_abs_path() == Some(root.as_ref())
+                                || snapshot
+                                    .linked_worktrees()
+                                    .iter()
+                                    .any(|worktree| worktree.path.as_path() == root.as_ref())
                         })?;
                         Some((
                             workspace.clone(),
