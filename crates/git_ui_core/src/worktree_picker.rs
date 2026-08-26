@@ -4,7 +4,9 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use collections::HashSet;
 use fuzzy::StringMatchCandidate;
-use git::repository::Worktree as GitWorktree;
+use futures::StreamExt as _;
+use git::repository::{Worktree as GitWorktree, parse_worktrees_from_str};
+use fs::Fs;
 use gpui::{
     Action, AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement, IntoElement, Modifiers, ModifiersChangedEvent, ParentElement, PromptLevel,
@@ -12,7 +14,7 @@ use gpui::{
 };
 use picker::{Picker, PickerDelegate, PickerEditorPosition};
 use project::Project;
-use project::git_store::RepositoryEvent;
+use project::git_store::{Repository, RepositoryEvent};
 use ui::{
     Button, CommonAnimationExt as _, Divider, HighlightedLabel, IconButton, KeyBinding, ListItem,
     ListItemSpacing, ListSubHeader, Tooltip, prelude::*,
@@ -57,17 +59,26 @@ impl WorktreePicker {
         let focused_dock = workspace
             .upgrade()
             .and_then(|workspace| workspace.read(cx).focused_dock_position(window, cx));
-        Self::new_inner(project, workspace, focused_dock, false, window, cx)
+        Self::new_inner(project, workspace, focused_dock, false, None, window, cx)
     }
 
     pub fn new_modal(
         project: Entity<Project>,
         workspace: WeakEntity<Workspace>,
         focused_dock: Option<DockPosition>,
+        target_repository: Option<Entity<Repository>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::new_inner(project, workspace, focused_dock, true, window, cx)
+        Self::new_inner(
+            project,
+            workspace,
+            focused_dock,
+            true,
+            target_repository,
+            window,
+            cx,
+        )
     }
 
     fn new_inner(
@@ -75,6 +86,7 @@ impl WorktreePicker {
         workspace: WeakEntity<Workspace>,
         focused_dock: Option<DockPosition>,
         show_footer: bool,
+        target_repository: Option<Entity<Repository>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -88,7 +100,20 @@ impl WorktreePicker {
         let project_worktree_paths = active_worktree_paths.clone();
 
         let has_multiple_repositories = project_ref.repositories(cx).len() > 1;
-        let repository = project_ref.active_repository(cx);
+        let repository = target_repository
+            .clone()
+            .or_else(|| project_ref.active_repository(cx));
+        let is_local = project_ref.is_local();
+        let fs = project_ref.fs().clone();
+        let project_repo_roots: HashSet<PathBuf> = project_ref
+            .repositories(cx)
+            .values()
+            .filter_map(|repo| {
+                repo.read(cx)
+                    .main_worktree_abs_path()
+                    .map(Path::to_path_buf)
+            })
+            .collect();
 
         let current_branch_name = repository.as_ref().and_then(|repo| {
             repo.read(cx)
@@ -110,11 +135,13 @@ impl WorktreePicker {
         let delegate = WorktreePickerDelegate {
             matches: initial_matches,
             all_worktrees: Vec::new(),
-            project_worktree_paths,
+            external_repos: Vec::new(),
+            project_worktree_paths: project_worktree_paths.clone(),
             selected_index: 0,
             project,
             workspace,
             focused_dock,
+            target_repository,
             current_branch_name,
             default_branch: None,
             has_multiple_repositories,
@@ -137,6 +164,31 @@ impl WorktreePicker {
         picker.update(cx, |picker, _| {
             picker.delegate.focus_handle = picker_focus_handle;
         });
+
+        if is_local {
+            let scan_roots: HashSet<PathBuf> = project_repo_roots
+                .iter()
+                .chain(project_worktree_paths.iter())
+                .filter_map(|path| path.parent().map(Path::to_path_buf))
+                .collect();
+            if !scan_roots.is_empty() {
+                let scan_task = cx.background_spawn(scan_external_repos(
+                    scan_roots,
+                    project_repo_roots,
+                    fs,
+                ));
+                let picker_handle = picker.downgrade();
+                cx.spawn_in(window, async move |_this, cx| {
+                    let external_repos = scan_task.await;
+                    picker_handle.update_in(cx, |picker, window, cx| {
+                        picker.delegate.external_repos = external_repos;
+                        picker.refresh(window, cx);
+                    })?;
+                    anyhow::Ok(())
+                })
+                .detach_and_log_err(cx);
+            }
+        }
 
         let mut subscriptions = Vec::new();
 
@@ -168,7 +220,7 @@ impl WorktreePicker {
                 picker_handle.update_in(cx, |picker, window, cx| {
                     picker.delegate.all_worktrees = all_worktrees;
                     picker.delegate.default_branch =
-                        default_branch.and_then(|branch| RemoteBranchName::parse(&branch));
+                        default_branch.and_then(|branch| RemoteBranchName::parse(branch.as_str()));
                     picker.delegate.refresh_project_worktree_paths(window, cx);
                     picker.refresh(window, cx);
                 })?;
@@ -278,6 +330,7 @@ enum WorktreeEntry {
     Worktree {
         worktree: GitWorktree,
         positions: Vec<usize>,
+        repo_name: Option<SharedString>,
     },
     CreateNamed {
         name: String,
@@ -286,15 +339,25 @@ enum WorktreeEntry {
     },
 }
 
+/// A repository that is not part of the current project, discovered by
+/// scanning directories near the project's repositories, with its worktrees.
+struct ExternalRepo {
+    name: SharedString,
+    main_path: PathBuf,
+    worktrees: Vec<GitWorktree>,
+}
+
 struct WorktreePickerDelegate {
     matches: Vec<WorktreeEntry>,
     all_worktrees: Vec<GitWorktree>,
+    external_repos: Vec<ExternalRepo>,
     project_worktree_paths: HashSet<PathBuf>,
     active_worktree_paths: HashSet<PathBuf>,
     selected_index: usize,
     project: Entity<Project>,
     workspace: WeakEntity<Workspace>,
     focused_dock: Option<DockPosition>,
+    target_repository: Option<Entity<Repository>>,
     current_branch_name: Option<String>,
     default_branch: Option<RemoteBranchName>,
     has_multiple_repositories: bool,
@@ -834,6 +897,7 @@ impl PickerDelegate for WorktreePickerDelegate {
                         matches.push(WorktreeEntry::Worktree {
                             worktree,
                             positions: Vec::new(),
+                            repo_name: None,
                         });
                     }
 
@@ -845,6 +909,7 @@ impl PickerDelegate for WorktreePickerDelegate {
                         matches.push(WorktreeEntry::Worktree {
                             worktree,
                             positions: Vec::new(),
+                            repo_name: None,
                         });
                     }
                 } else {
@@ -852,8 +917,29 @@ impl PickerDelegate for WorktreePickerDelegate {
                         matches.push(WorktreeEntry::Worktree {
                             worktree,
                             positions: Vec::new(),
+                            repo_name: None,
                         });
                     }
+                }
+            }
+
+            for repo in &self.external_repos {
+                let worktrees: Vec<_> = repo
+                    .worktrees
+                    .iter()
+                    .filter(|worktree| !self.project_worktree_paths.contains(&worktree.path))
+                    .collect();
+                if worktrees.is_empty() {
+                    continue;
+                }
+                matches.push(WorktreeEntry::Separator);
+                matches.push(WorktreeEntry::SectionHeader(repo.name.clone()));
+                for worktree in worktrees {
+                    matches.push(WorktreeEntry::Worktree {
+                        worktree: worktree.clone(),
+                        positions: Vec::new(),
+                        repo_name: Some(repo.name.clone()),
+                    });
                 }
             }
 
@@ -866,16 +952,29 @@ impl PickerDelegate for WorktreePickerDelegate {
             .iter()
             .find(|wt| wt.is_main)
             .map(|wt| wt.path.clone());
-        let candidates: Vec<_> = repo_worktrees
-            .iter()
-            .enumerate()
-            .map(|(ix, worktree)| {
-                StringMatchCandidate::new(
-                    ix,
-                    &worktree.directory_name(main_worktree_path.as_deref()),
-                )
-            })
-            .collect();
+        let mut candidates: Vec<StringMatchCandidate> = Vec::new();
+        let mut candidate_worktrees: Vec<(GitWorktree, Option<SharedString>)> = Vec::new();
+        for worktree in &repo_worktrees {
+            candidates.push(StringMatchCandidate::new(
+                candidate_worktrees.len(),
+                &worktree.directory_name(main_worktree_path.as_deref()),
+            ));
+            candidate_worktrees.push((worktree.clone(), None));
+        }
+        for repo in &self.external_repos {
+            for worktree in &repo.worktrees {
+                if self.project_worktree_paths.contains(&worktree.path) {
+                    continue;
+                }
+                let label = format!(
+                    "{}/{}",
+                    repo.name,
+                    worktree.directory_name(Some(repo.main_path.as_path()))
+                );
+                candidates.push(StringMatchCandidate::new(candidate_worktrees.len(), &label));
+                candidate_worktrees.push((worktree.clone(), Some(repo.name.clone())));
+            }
+        }
 
         let executor = cx.background_executor().clone();
 
@@ -892,7 +991,7 @@ impl PickerDelegate for WorktreePickerDelegate {
             .await
         });
 
-        let repo_worktrees_clone = repo_worktrees;
+        let candidate_worktrees_clone = candidate_worktrees;
         cx.spawn_in(window, async move |picker, cx| {
             let fuzzy_matches = task.await;
 
@@ -901,9 +1000,12 @@ impl PickerDelegate for WorktreePickerDelegate {
                     let mut new_matches: Vec<WorktreeEntry> = Vec::new();
 
                     for candidate in &fuzzy_matches {
+                        let (worktree, repo_name) =
+                            candidate_worktrees_clone[candidate.candidate_id].clone();
                         new_matches.push(WorktreeEntry::Worktree {
-                            worktree: repo_worktrees_clone[candidate.candidate_id].clone(),
+                            worktree,
                             positions: candidate.positions.clone(),
+                            repo_name,
                         });
                     }
 
@@ -956,6 +1058,7 @@ impl PickerDelegate for WorktreePickerDelegate {
                             },
                             window,
                             self.focused_dock,
+                            self.target_repository.clone(),
                             cx,
                         );
                     });
@@ -978,12 +1081,17 @@ impl PickerDelegate for WorktreePickerDelegate {
                             },
                             window,
                             self.focused_dock,
+                            self.target_repository.clone(),
                             cx,
                         );
                     });
                 }
             }
-            WorktreeEntry::Worktree { worktree, .. } => {
+            WorktreeEntry::Worktree {
+                worktree,
+                repo_name,
+                ..
+            } => {
                 if self.deleting_worktree_paths.contains(&worktree.path) {
                     return;
                 }
@@ -999,11 +1107,18 @@ impl PickerDelegate for WorktreePickerDelegate {
                             cx,
                         );
                     } else {
-                        let main_worktree_path = self
-                            .all_worktrees
-                            .iter()
-                            .find(|wt| wt.is_main)
-                            .map(|wt| wt.path.as_path());
+                        let main_worktree_path = match repo_name {
+                            Some(repo_name) => self
+                                .external_repos
+                                .iter()
+                                .find(|repo| &repo.name == repo_name)
+                                .map(|repo| repo.main_path.as_path()),
+                            None => self
+                                .all_worktrees
+                                .iter()
+                                .find(|wt| wt.is_main)
+                                .map(|wt| wt.path.as_path()),
+                        };
                         if let Some(workspace) = self.workspace.upgrade() {
                             workspace.update(cx, |workspace, cx| {
                                 crate::worktree_service::handle_switch_worktree(
@@ -1043,6 +1158,7 @@ impl PickerDelegate for WorktreePickerDelegate {
                             },
                             window,
                             self.focused_dock,
+                            self.target_repository.clone(),
                             cx,
                         );
                     });
@@ -1119,13 +1235,29 @@ impl PickerDelegate for WorktreePickerDelegate {
             WorktreeEntry::Worktree {
                 worktree,
                 positions,
+                repo_name,
             } => {
-                let main_worktree_path = self
-                    .all_worktrees
-                    .iter()
-                    .find(|wt| wt.is_main)
-                    .map(|wt| wt.path.as_path());
-                let display_name = worktree.directory_name(main_worktree_path);
+                let main_worktree_path = match repo_name {
+                    Some(repo_name) => self
+                        .external_repos
+                        .iter()
+                        .find(|repo| &repo.name == repo_name)
+                        .map(|repo| repo.main_path.as_path()),
+                    None => self
+                        .all_worktrees
+                        .iter()
+                        .find(|wt| wt.is_main)
+                        .map(|wt| wt.path.as_path()),
+                };
+                let display_name = match repo_name {
+                    Some(repo_name) => {
+                        format!(
+                            "{repo_name}/{}",
+                            worktree.directory_name(main_worktree_path)
+                        )
+                    }
+                    None => worktree.directory_name(main_worktree_path),
+                };
                 let first_line = display_name.lines().next().unwrap_or(&display_name);
                 let positions: Vec<_> = positions
                     .iter()
@@ -1137,7 +1269,8 @@ impl PickerDelegate for WorktreePickerDelegate {
 
                 let is_current = self.active_worktree_paths.contains(&worktree.path);
                 let is_deleting = self.deleting_worktree_paths.contains(&worktree.path);
-                let can_delete = self.can_delete_worktree(worktree);
+                let can_delete =
+                    repo_name.is_none() && self.can_delete_worktree(worktree);
                 let can_remove_from_window =
                     !is_current && self.project_worktree_paths.contains(&worktree.path);
 
@@ -1407,7 +1540,8 @@ impl PickerDelegate for WorktreePickerDelegate {
             selected_entry.is_some_and(|e| matches!(e, WorktreeEntry::Worktree { .. }));
 
         let can_delete = selected_entry.is_some_and(|e| {
-            matches!(e, WorktreeEntry::Worktree { worktree, .. } if self.can_delete_worktree(worktree))
+            matches!(e, WorktreeEntry::Worktree { worktree, repo_name, .. } if
+                repo_name.is_none() && self.can_delete_worktree(worktree))
         });
 
         let is_current = selected_entry.is_some_and(|e| {
@@ -1660,6 +1794,96 @@ pub async fn open_remote_worktree(
     Ok(())
 }
 
+/// Discovers git repositories near the project — sibling directories of the
+/// open repositories and of the project's worktrees, two levels deep — and
+/// lists each repository's worktrees, so the picker can jump across
+/// repositories without opening them first.
+async fn scan_external_repos(
+    scan_roots: HashSet<PathBuf>,
+    project_repo_roots: HashSet<PathBuf>,
+    fs: Arc<dyn Fs>,
+) -> Vec<ExternalRepo> {
+    let mut candidate_dirs: Vec<PathBuf> = Vec::new();
+    for root in scan_roots {
+        let Ok(mut entries) = fs.read_dir(&root).await else {
+            continue;
+        };
+        while let Some(child) = entries.next().await {
+            let child = match child {
+                Ok(child) => child,
+                Err(_) => continue,
+            };
+            if is_repo_dir(&fs, &child).await {
+                candidate_dirs.push(child);
+                continue;
+            }
+            let Ok(mut sub_entries) = fs.read_dir(&child).await else {
+                continue;
+            };
+            while let Some(sub_dir) = sub_entries.next().await {
+                match sub_dir {
+                    Ok(sub_dir) if is_repo_dir(&fs, &sub_dir).await => {
+                        candidate_dirs.push(sub_dir);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let mut main_paths: Vec<PathBuf> = Vec::new();
+    for dir in candidate_dirs {
+        if let Some(main_path) = crate::env_vault::primary_checkout_dir(&fs, &dir).await
+            && !project_repo_roots.contains(&main_path)
+        {
+            main_paths.push(main_path);
+        }
+    }
+    main_paths.sort();
+    main_paths.dedup();
+
+    let mut external_repos = Vec::new();
+    for main_path in main_paths {
+        let Ok(output) = smol::process::Command::new("git")
+            .arg("-C")
+            .arg(&main_path)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .await
+        else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let worktrees: Vec<GitWorktree> = parse_worktrees_from_str(
+            String::from_utf8_lossy(&output.stdout).as_ref(),
+            Some(&main_path),
+        )
+        .into_iter()
+        .filter(|worktree| !worktree.is_bare)
+        .collect();
+        if worktrees.is_empty() {
+            continue;
+        }
+        let Some(name) = main_path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        external_repos.push(ExternalRepo {
+            name: SharedString::from(name.to_string()),
+            main_path,
+            worktrees,
+        });
+    }
+    external_repos
+}
+
+async fn is_repo_dir(fs: &Arc<dyn Fs>, path: &Path) -> bool {
+    fs.metadata(&path.join(".git"))
+        .await
+        .is_ok_and(|metadata| metadata.is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1901,6 +2125,75 @@ mod tests {
                     }
                     _ => panic!("named worktree creation should prefer the remote default branch"),
                 })
+        });
+    }
+
+    #[gpui::test]
+    async fn test_external_repo_worktrees_are_listed(cx: &mut TestAppContext) {
+        let (_fs, worktree_picker, _repository, _worktree_path, mut cx) =
+            init_worktree_picker_test(cx).await;
+
+        worktree_picker.update(&mut cx, |worktree_picker, cx| {
+            worktree_picker.picker.update(cx, |picker, _| {
+                picker.delegate.external_repos = vec![ExternalRepo {
+                    name: SharedString::from("other-repo"),
+                    main_path: PathBuf::from(path!("/root/other-repo")),
+                    worktrees: vec![
+                        GitWorktree {
+                            path: PathBuf::from(path!("/root/other-repo")),
+                            ref_name: Some("refs/heads/main".into()),
+                            sha: "deadbeef".into(),
+                            is_main: true,
+                            is_bare: false,
+                        },
+                        GitWorktree {
+                            path: PathBuf::from(path!("/root/other-worktrees/feature")),
+                            ref_name: Some("refs/heads/feature".into()),
+                            sha: "deadbeef".into(),
+                            is_main: false,
+                            is_bare: false,
+                        },
+                    ],
+                }];
+            });
+        });
+
+        let update_matches = worktree_picker.update_in(&mut cx, |worktree_picker, window, cx| {
+            worktree_picker
+                .picker
+                .update(cx, |picker, cx| picker.delegate.update_matches(String::new(), window, cx))
+        });
+        update_matches.await;
+        cx.run_until_parked();
+
+        worktree_picker.update(&mut cx, |worktree_picker, cx| {
+            worktree_picker.picker.update(cx, |picker, _| {
+                let matches = &picker.delegate.matches;
+                assert!(matches.iter().any(|entry| matches!(entry,
+                    WorktreeEntry::SectionHeader(name) if name.as_ref() == "other-repo")));
+                assert!(matches.iter().any(|entry| matches!(entry,
+                    WorktreeEntry::Worktree { worktree, repo_name: Some(repo_name), .. }
+                    if worktree.path == *path!("/root/other-worktrees/feature")
+                        && repo_name.as_ref() == "other-repo")));
+            })
+        });
+
+        let update_matches = worktree_picker.update_in(&mut cx, |worktree_picker, window, cx| {
+            worktree_picker.picker.update(cx, |picker, cx| {
+                picker
+                    .delegate
+                    .update_matches("other-repo/feature".to_string(), window, cx)
+            })
+        });
+        update_matches.await;
+        cx.run_until_parked();
+
+        worktree_picker.update(&mut cx, |worktree_picker, cx| {
+            worktree_picker.picker.update(cx, |picker, _| {
+                assert!(picker.delegate.matches.iter().any(|entry| matches!(entry,
+                    WorktreeEntry::Worktree { worktree, repo_name: Some(_), .. }
+                    if worktree.path == *path!("/root/other-worktrees/feature"))));
+            })
         });
     }
 

@@ -80,7 +80,7 @@ async fn is_file_like(fs: &Arc<dyn Fs>, path: &Path) -> bool {
 /// the path itself when it is the primary checkout, otherwise the checkout
 /// owning its `.git` pointer file. `None` for non-git paths and bare
 /// repositories, which have no checkout to source env files from.
-async fn primary_checkout_dir(fs: &Arc<dyn Fs>, worktree_path: &Path) -> Option<PathBuf> {
+pub(crate) async fn primary_checkout_dir(fs: &Arc<dyn Fs>, worktree_path: &Path) -> Option<PathBuf> {
     let dot_git = worktree_path.join(".git");
     let metadata = fs.metadata(&dot_git).await.ok()??;
     if metadata.is_dir && !metadata.is_symlink {

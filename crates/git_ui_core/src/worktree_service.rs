@@ -274,6 +274,7 @@ impl Render for WorktreeFetchFailedToast {
                                 },
                                 window,
                                 focused_dock,
+                                None,
                                 RemoteBranchFetchMode::UseLocal,
                                 // User-initiated retry of a foreground create.
                                 true,
@@ -690,6 +691,7 @@ pub fn handle_create_worktree(
     action: &zed_actions::CreateWorktree,
     window: &mut gpui::Window,
     fallback_focused_dock: Option<DockPosition>,
+    target_repository: Option<Entity<Repository>>,
     cx: &mut gpui::Context<Workspace>,
 ) {
     let task = create_worktree_workspace_inner(
@@ -697,6 +699,7 @@ pub fn handle_create_worktree(
         action,
         window,
         fallback_focused_dock,
+        target_repository,
         RemoteBranchFetchMode::Fetch,
         // The user explicitly asked to create a worktree, so foreground it.
         true,
@@ -745,6 +748,7 @@ pub fn create_worktree_workspace(
         action,
         window,
         fallback_focused_dock,
+        None,
         RemoteBranchFetchMode::Fetch,
         // Agent-created worktree workspaces open in the background.
         false,
@@ -757,6 +761,7 @@ fn create_worktree_workspace_inner(
     action: &zed_actions::CreateWorktree,
     window: &mut gpui::Window,
     fallback_focused_dock: Option<DockPosition>,
+    target_repository: Option<Entity<Repository>>,
     remote_branch_fetch_mode: RemoteBranchFetchMode,
     activate: bool,
     cx: &mut gpui::Context<Workspace>,
@@ -789,6 +794,20 @@ fn create_worktree_workspace_inner(
     let remote_connection_options = project.read(cx).remote_connection_options(cx);
 
     let (git_repos, non_git_paths) = classify_worktrees(project.read(cx), cx);
+
+    // When the creation was requested for a specific repository (per-repo
+    // "+" in the sidebar), only create a worktree there and skip opening
+    // non-git paths from the rest of the project.
+    let (git_repos, non_git_paths) = match target_repository {
+        Some(target_repository) => (
+            git_repos
+                .into_iter()
+                .filter(|repo| repo.entity_id() == target_repository.entity_id())
+                .collect(),
+            Vec::new(),
+        ),
+        None => (git_repos, non_git_paths),
+    };
 
     if git_repos.is_empty() {
         let toast_workspace = cx.entity();
@@ -1572,6 +1591,7 @@ mod tests {
                 },
                 window,
                 None,
+                None,
                 cx,
             );
         });
@@ -1705,6 +1725,7 @@ mod tests {
                     branch_target: NewWorktreeBranchTarget::CurrentBranch,
                 },
                 window,
+                None,
                 None,
                 cx,
             );

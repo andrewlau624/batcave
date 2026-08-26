@@ -7,15 +7,17 @@ use git::repository::{Branch, delete_branch_flag};
 use git::{GitHostingProviderRegistry, parse_git_remote_url};
 use gpui::http_client::Url;
 use gpui::{
-    Action, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Global,
-    InteractiveElement, IntoElement, Modifiers, ModifiersChangedEvent, ParentElement, PromptLevel,
-    Render, SharedString, Styled, Subscription, Task, TaskExt, WeakEntity, Window, actions, rems,
+    Action, App, AsyncWindowContext, Context, DismissEvent, Entity, EventEmitter, FocusHandle,
+    Focusable, Global, InteractiveElement, IntoElement, Modifiers, ModifiersChangedEvent,
+    ParentElement, PromptLevel, Render, SharedString, Styled, Subscription, Task, TaskExt,
+    WeakEntity, Window, actions, rems,
 };
 use picker::{Picker, PickerDelegate, PickerEditorPosition};
 use project::git_store::{Repository, RepositoryEvent};
 use project::project_settings::ProjectSettings;
 use settings::Settings;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use time::OffsetDateTime;
 use ui::{
@@ -837,6 +839,79 @@ fn force_delete_prompt_for_branch_delete_error(
         .map(|prompt| (prompt.message)(branch_name))
 }
 
+// Git refuses to check out a branch that is already checked out in another
+// worktree; extract that worktree's path from the stderr so the user can jump
+// there instead of being stuck with an opaque failure. Matching is
+// best-effort: git's wording varies by version and locale.
+fn worktree_path_from_branch_in_use_error(error: &anyhow::Error) -> Option<PathBuf> {
+    const MARKERS: [&str; 2] = [
+        "is already used by worktree at",
+        "is already checked out at",
+    ];
+    let message = format!("{error:#}");
+    let lowered = message.to_ascii_lowercase();
+    let (position, marker) = MARKERS
+        .iter()
+        .filter_map(|marker| lowered.find(marker).map(|position| (position, marker)))
+        .min_by_key(|(position, _)| *position)?;
+    let rest = message[position + marker.len()..].trim_start();
+    let rest = rest.strip_prefix('\'')?;
+    let end = rest.find('\'')?;
+    Some(PathBuf::from(&rest[..end]))
+}
+
+async fn prompt_to_open_conflicting_worktree(
+    workspace: WeakEntity<Workspace>,
+    branch_name: &str,
+    worktree_path: &PathBuf,
+    cx: &mut AsyncWindowContext,
+) {
+    let Ok(prompt) = cx.update(|window, cx| {
+        window.prompt(
+            PromptLevel::Warning,
+            &format!(
+                "Branch '{}' is already checked out in another worktree",
+                branch_name
+            ),
+            Some(&format!(
+                "Git can't check out '{}' here while it's active at {}.",
+                branch_name,
+                worktree_path.display()
+            )),
+            &["Open That Worktree", "Cancel"],
+            cx,
+        )
+    }) else {
+        return;
+    };
+
+    if prompt.await != Ok(0) {
+        return;
+    }
+
+    let display_name = worktree_path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| worktree_path.display().to_string());
+    cx.update(|window, cx| {
+        workspace
+            .update(cx, |workspace, cx| {
+                git_ui_core::worktree_service::handle_switch_worktree(
+                    workspace,
+                    &zed_actions::SwitchWorktree {
+                        path: worktree_path.clone(),
+                        display_name,
+                    },
+                    window,
+                    None,
+                    cx,
+                );
+            })
+            .log_err();
+    })
+    .ok();
+}
+
 struct DeleteBranchTooltip {
     picker: WeakEntity<Picker<BranchListDelegate>>,
     focus_handle: FocusHandle,
@@ -1566,18 +1641,49 @@ impl PickerDelegate for BranchListDelegate {
                 };
 
                 let branch = branch.clone();
-                cx.spawn(async move |_, cx| {
-                    repo.update(cx, |repo, _| repo.change_branch(branch.name().to_string()))
-                        .await??;
+                let workspace = self.workspace.clone();
+                cx.spawn_in(window, async move |_, mut cx| {
+                    let checkout_error = match repo
+                        .update(cx, |repo, _| {
+                            repo.change_branch(branch.name().to_string())
+                        })
+                        .await
+                    {
+                        Ok(Ok(())) => None,
+                        Ok(Err(error)) => Some(error),
+                        Err(_canceled) => None,
+                    };
+
+                    if let Some(error) = checkout_error {
+                        log::error!("Failed to change branch: {error:#}");
+                        if let Some(worktree_path) =
+                            worktree_path_from_branch_in_use_error(&error)
+                        {
+                            prompt_to_open_conflicting_worktree(
+                                workspace,
+                                branch.name(),
+                                &worktree_path,
+                                &mut cx,
+                            )
+                            .await;
+                        } else {
+                            let detail = format!("{error:#}.");
+                            cx.update(|window, cx| {
+                                window.prompt(
+                                    PromptLevel::Critical,
+                                    "Failed to change branch",
+                                    Some(&detail),
+                                    &["OK"],
+                                    cx,
+                                )
+                            })
+                            .ok();
+                        }
+                    }
 
                     anyhow::Ok(())
                 })
-                .detach_and_prompt_err(
-                    "Failed to change branch",
-                    window,
-                    cx,
-                    |_, _, _| None,
-                );
+                .detach();
             }
             Entry::NewUrl { url } => {
                 self.state = PickerState::CreateRemote(url.clone().into());
@@ -3457,5 +3563,26 @@ mod tests {
                 assert_eq!(picker.delegate.matches.len(), branch_count as usize);
             })
         });
+    }
+
+    #[test]
+    fn test_worktree_path_from_branch_in_use_error() {
+        let parse = |stderr: &str| {
+            worktree_path_from_branch_in_use_error(&anyhow::anyhow!(
+                "Git command failed:\n{stderr}\n"
+            ))
+        };
+
+        assert_eq!(
+            parse("fatal: 'main' is already used by worktree at '/repo/main checkout'\n"),
+            Some(PathBuf::from("/repo/main checkout"))
+        );
+        assert_eq!(
+            parse("fatal: 'feature' is already checked out at '/repo/wt'\n"),
+            Some(PathBuf::from("/repo/wt"))
+        );
+        // Unrelated failures must not produce a path.
+        assert_eq!(parse("error: pathspec 'nope' did not match any file(s)\n"), None);
+        assert_eq!(parse(""), None);
     }
 }

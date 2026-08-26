@@ -117,7 +117,7 @@ pub fn init(cx: &mut App) {
         workspace.register_action(
             |workspace, action: &zed_actions::CreateWorktree, window, cx| {
                 git_ui_core::worktree_service::handle_create_worktree(
-                    workspace, action, window, None, cx,
+                    workspace, action, window, None, None, cx,
                 );
             },
         );
@@ -138,6 +138,7 @@ pub fn init(cx: &mut App) {
                     project,
                     workspace_handle,
                     focused_dock,
+                    None,
                     window,
                     cx,
                 )
