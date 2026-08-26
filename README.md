@@ -12,24 +12,41 @@ This repo is a Zed fork personalized for parallelization across multiple repos a
 > [!IMPORTANT]
 > Remove this line to confirm you've reviewed this PR before submitting.
 
-# Zed
+# Batcave
 
-[![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)
-[![CI](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml/badge.svg)](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml)
+<p align="center">
+  <img src="crates/zed/resources/app-icon.png" alt="Batcave logo" width="200" />
+</p>
 
-Welcome to Zed, a high-performance, multiplayer code editor from the creators of [Atom](https://github.com/atom/atom) and [Tree-sitter](https://github.com/tree-sitter/tree-sitter).
+Welcome to my Batcave.
+
+This is a fork of [Zed](https://github.com/zed-industries/zed) — the high-performance, multiplayer code editor from the creators of [Atom](https://github.com/atom/atom) and [Tree-sitter](https://github.com/tree-sitter/tree-sitter) — that I've personalized for parallelizing workflows.
+
+It's called Batcave because I like Batman, and this is my own personal tool. My own batcave, if you will. It's built the way I like it, with the things I use every day.
+
+[![CI](https://github.com/andrewlau624/bonsai/actions/workflows/run_tests.yml/badge.svg)](https://github.com/andrewlau624/bonsai/actions/workflows/run_tests.yml)
 
 ---
 
-### Installation
+### Installing
 
-On macOS, Linux, and Windows you can [download Zed directly](https://zed.dev/download) or install Zed via your local package manager ([macOS](https://zed.dev/docs/installation#macos)/[Linux](https://zed.dev/docs/linux#installing-via-a-package-manager)/[Windows](https://zed.dev/docs/windows#package-managers)).
+Build the app and install it into your Applications folder:
 
-Other platforms are not yet available:
+```sh
+./script/install
+```
 
-- Web ([tracking discussion](https://github.com/zed-industries/zed/discussions/26195))
+This compiles a release build, bundles `Batcave.app`, and moves it into `/Applications`. (Under the hood it's `./script/bundle-mac -i`.)
 
-### Developing Zed
+### Updating
+
+```sh
+./script/update-fork
+```
+
+This pulls the latest upstream Zed, rebases your fork-specific changes on top of it, bumps the patch version in `crates/zed/Cargo.toml`, and tags the result `batcave-vX.Y.Z`. If the rebase hits conflicts, resolve them and run `git rebase --continue`.
+
+### Developing Batcave
 
 - [Building Zed for macOS](./docs/src/development/macos.md)
 - [Building Zed for Linux](./docs/src/development/linux.md)
@@ -53,10 +70,6 @@ We use [`cargo-about`](https://github.com/EmbarkStudios/cargo-about) to automati
 - Is the error `failed to satisfy license requirements` for a dependency? If so, first determine what license the project has and whether this system is sufficient to comply with this license's requirements. If you're unsure, ask a lawyer. Once you've verified that this system is acceptable add the license's SPDX identifier to the `accepted` array in `script/licenses/zed-licenses.toml`.
 - Is `cargo-about` unable to find the license for a dependency? If so, add a clarification field at the end of `script/licenses/zed-licenses.toml`, as specified in the [cargo-about book](https://embarkstudios.github.io/cargo-about/cli/generate/config.html#crate-configuration).
 
-## Sponsorship
+## Upstream
 
-Zed is developed by **Zed Industries, Inc.**, a for-profit company.
-
-If you’d like to financially support the project, you can do so via GitHub Sponsors.
-Sponsorships go directly to Zed Industries and are used as general company revenue.
-There are no perks or entitlements associated with sponsorship.
+This fork is built on top of [Zed](https://github.com/zed-industries/zed), developed by **Zed Industries, Inc.** — a for-profit company. If you'd like to support the original project, check out their [GitHub Sponsors](https://github.com/sponsors/zed-industries) page.

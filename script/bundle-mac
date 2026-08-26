@@ -243,10 +243,13 @@ function sign_app_binaries() {
             echo "$app_path"
         fi
     else
-        dmg_target_directory="target/${target_triple}/${target_dir}"
-        dmg_source_directory="${dmg_target_directory}/dmg"
-        dmg_file_path="${dmg_target_directory}/Zed-${arch_suffix}.dmg"
-        xcode_bin_dir_path="$(xcode-select -p)/usr/bin"
+        if [ "$local_install" = true ]; then
+            echo "Installed to /Applications - skipping DMG creation"
+        else
+            dmg_target_directory="target/${target_triple}/${target_dir}"
+            dmg_source_directory="${dmg_target_directory}/dmg"
+            dmg_file_path="${dmg_target_directory}/Zed-${arch_suffix}.dmg"
+            xcode_bin_dir_path="$(xcode-select -p)/usr/bin"
 
         rm -rf ${dmg_source_directory}
         mkdir -p ${dmg_source_directory}
@@ -279,6 +282,7 @@ function sign_app_binaries() {
 
         if [ "$open_result" = true ]; then
             open $dmg_target_directory
+        fi
         fi
     fi
 }
