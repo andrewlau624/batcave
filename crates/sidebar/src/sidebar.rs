@@ -1114,12 +1114,13 @@ impl Sidebar {
             |this, _, event: &project::git_store::GitStoreEvent, _window, cx| {
                 if matches!(
                     event,
-                    project::git_store::GitStoreEvent::RepositoryUpdated(
-                        _,
-                        project::git_store::RepositoryEvent::GitWorktreeListChanged
-                            | project::git_store::RepositoryEvent::HeadChanged,
-                        _,
-                    )
+                    project::git_store::GitStoreEvent::RepositoryAdded
+                        | project::git_store::GitStoreEvent::RepositoryUpdated(
+                            _,
+                            project::git_store::RepositoryEvent::GitWorktreeListChanged
+                                | project::git_store::RepositoryEvent::HeadChanged,
+                            _,
+                        )
                 ) {
                     this.schedule_update_entries(false, cx);
                 }
