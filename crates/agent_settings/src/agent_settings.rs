@@ -11,7 +11,9 @@ use collections::{HashSet, IndexMap};
 use fs::Fs;
 use futures::channel::oneshot;
 use gpui::{App, Pixels, SharedString};
-use language_model::LanguageModel;
+use language_model::{
+    ConfiguredModel, LanguageModel, LanguageModelProviderId, LanguageModelRegistry,
+};
 use project::DisableAiSettings;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -21,6 +23,7 @@ use settings::{
     SettingsStore, SidebarDockPosition, SidebarSide, ThinkingBlockDisplay, ToolPermissionMode,
     update_settings_file, update_settings_file_with_completion,
 };
+use settings_content::TimeAgnosticSettingsContent;
 use util::ResultExt as _;
 
 pub use crate::agent_profile::*;
@@ -224,6 +227,7 @@ pub struct AgentSettings {
     pub favorite_models: Vec<LanguageModelSelection>,
     pub default_profile: AgentProfileId,
     pub profiles: IndexMap<AgentProfileId, AgentProfileSettings>,
+    pub time_agnostic: TimeAgnosticSettings,
 
     pub notify_when_agent_waiting: NotifyWhenAgentWaiting,
     pub play_sound_when_agent_done: PlaySoundWhenAgentDone,
@@ -244,9 +248,95 @@ pub struct AgentSettings {
     pub sandbox_permissions: SandboxPermissions,
 }
 
+impl From<TimeAgnosticSettingsContent> for TimeAgnosticSettings {
+    fn from(content: TimeAgnosticSettingsContent) -> Self {
+        Self {
+            enabled: content.enabled.unwrap_or(false),
+            ladder: content
+                .ladder
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|entry| {
+                    let model = entry.model?;
+                    Some(TimeAgnosticLadderEntry {
+                        start: entry.start.unwrap_or_default(),
+                        end: entry.end.unwrap_or_default(),
+                        model,
+                    })
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TimeAgnosticSettings {
+    pub enabled: bool,
+    pub ladder: Vec<TimeAgnosticLadderEntry>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TimeAgnosticLadderEntry {
+    pub start: String,
+    pub end: String,
+    pub model: LanguageModelSelection,
+}
+
+fn parse_hhmm(value: &str) -> Option<u32> {
+    let (hours, minutes) = value.trim().split_once(':')?;
+    let hours: u32 = hours.parse().ok()?;
+    let minutes: u32 = minutes.parse().ok()?;
+    (hours < 24 && minutes < 60).then_some(hours * 60 + minutes)
+}
+
 impl AgentSettings {
     pub fn enabled(&self, cx: &App) -> bool {
         self.enabled && !DisableAiSettings::get_global(cx).disable_ai
+    }
+
+    /// The ladder entry active at the current time, when time-agnostic
+    /// routing is enabled.
+    pub fn time_agnostic_model_selection(&self) -> Option<LanguageModelSelection> {
+        if !self.time_agnostic.enabled {
+            return None;
+        }
+        let minutes = chrono::Timelike::num_seconds_from_midnight(&chrono::Local::now().time()) / 60;
+        self.time_agnostic
+            .ladder
+            .iter()
+            .find(|entry| {
+                let (Some(start), Some(end)) = (parse_hhmm(&entry.start), parse_hhmm(&entry.end))
+                else {
+                    return false;
+                };
+                if start <= end {
+                    minutes >= start && minutes < end
+                } else {
+                    minutes >= start || minutes < end
+                }
+            })
+            .map(|entry| entry.model.clone())
+    }
+
+    /// The resolved model for the current time window, when time-agnostic
+    /// routing is enabled.
+    pub fn time_agnostic_model(&self, cx: &App) -> Option<ConfiguredModel> {
+        let selection = self.time_agnostic_model_selection()?;
+        let registry = LanguageModelRegistry::read_global(cx);
+        let provider_id = LanguageModelProviderId::from(selection.provider.0.clone());
+        let provider = registry.provider(&provider_id)?;
+        let model = provider
+            .provided_models(cx)
+            .iter()
+            .find(|model| model.id().0 == selection.model.as_str())?
+            .clone();
+        Some(ConfiguredModel { provider, model })
+    }
+
+    /// The inline-assist model, honoring time-agnostic routing when enabled.
+    pub fn inline_assistant_model_time_aware(&self, cx: &App) -> Option<ConfiguredModel> {
+        self.time_agnostic_model(cx)
+            .or_else(|| LanguageModelRegistry::read_global(cx).inline_assistant_model())
     }
 
     pub fn temperature_for_model(model: &Arc<dyn LanguageModel>, cx: &App) -> Option<f32> {
@@ -789,6 +879,7 @@ impl Settings for AgentSettings {
                 .into_iter()
                 .map(|(key, val)| (AgentProfileId(key), val.into()))
                 .collect(),
+            time_agnostic: agent.time_agnostic.unwrap_or_default().into(),
 
             notify_when_agent_waiting: agent.notify_when_agent_waiting.unwrap(),
             play_sound_when_agent_done: agent.play_sound_when_agent_done.unwrap_or_default(),

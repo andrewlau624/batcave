@@ -1,7 +1,7 @@
 use std::{collections::HashSet, sync::Arc};
 
 use editor::Editor;
-use gpui::{AnyView, Entity, Focusable as _, ScrollHandle, prelude::*};
+use gpui::{AnyView, Entity, Focusable as _, ReadGlobal as _, ScrollHandle, prelude::*};
 use language_model::{
     ApiKeyConfiguration, CreateProviderSettingsView, IconOrSvg, InlineDescription,
     LanguageModelProvider, LanguageModelProviderId, LanguageModelRegistry, ProviderSettingsView,
@@ -9,17 +9,19 @@ use language_model::{
 
 use settings::{
     AnthropicCompatibleAvailableModel, AnthropicCompatibleModelCapabilities,
-    AnthropicCompatibleSettingsContent, OpenAiCompatibleAvailableModel,
-    OpenAiCompatibleModelCapabilities, OpenAiCompatibleSettingsContent, OpenAiReasoningEffort,
+    AnthropicCompatibleSettingsContent, LanguageModelProviderSetting, LanguageModelSelection,
+    OpenAiCompatibleAvailableModel, OpenAiCompatibleModelCapabilities,
+    OpenAiCompatibleSettingsContent, OpenAiReasoningEffort, SettingsStore,
 };
+use settings_content::TimeAgnosticLadderEntryContent;
 use ui::{
     ButtonLink, Checkbox, ConfiguredApiCard, ContextMenu, Divider, DividerColor, DropdownMenu,
-    DropdownStyle, IconPosition, PopoverMenu, ToggleState, prelude::*,
+    DropdownStyle, IconPosition, PopoverMenu, SwitchField, ToggleState, Tooltip, prelude::*,
 };
 use util::ResultExt as _;
 
 use crate::SettingsWindow;
-use crate::components::SettingsInputField;
+use crate::components::{SettingsInputField, SettingsSectionHeader};
 
 pub(crate) fn render_llm_providers_page(
     settings_window: &SettingsWindow,
@@ -36,6 +38,8 @@ pub(crate) fn render_llm_providers_page(
         .pb_16()
         .track_scroll(scroll_handle)
         .overflow_y_scroll()
+        .child(render_time_agnostic_section(window, cx))
+        .child(Divider::horizontal())
         .children(
             providers
                 .iter()
@@ -46,6 +50,232 @@ pub(crate) fn render_llm_providers_page(
                 .collect::<Vec<_>>(),
         )
         .into_any_element()
+}
+
+fn render_time_agnostic_section(
+    window: &mut Window,
+    cx: &mut Context<SettingsWindow>,
+) -> AnyElement {
+    let time_agnostic = SettingsStore::global(cx)
+        .raw_user_settings()
+        .and_then(|user| user.content.agent.as_ref())
+        .and_then(|agent| agent.time_agnostic.as_ref());
+    let enabled = time_agnostic.and_then(|ta| ta.enabled).unwrap_or(false);
+    let ladder = time_agnostic
+        .and_then(|ta| ta.ladder.clone())
+        .unwrap_or_default();
+
+    let rows: Vec<AnyElement> = ladder
+        .into_iter()
+        .enumerate()
+        .map(|(index, entry)| render_time_agnostic_row(index, entry, window, cx))
+        .collect();
+
+    v_flex()
+        .gap_4()
+        .child(SettingsSectionHeader::new("Time Agnostic").no_padding(true))
+        .child(
+            SwitchField::new(
+                "time-agnostic-enabled",
+                Some("Time Agnostic Model Routing"),
+                Some(
+                    "Route model requests to different models based on the current time. \
+                     When on, new threads and inline assists use the model for the current \
+                     time window; leave it off to keep using your chosen model."
+                        .into(),
+                ),
+                enabled,
+                move |state, _window, cx| {
+                    set_time_agnostic_enabled(*state == ToggleState::Selected, cx);
+                },
+            )
+            .tab_index(0),
+        )
+        .child(
+            v_flex()
+                .gap_1p5()
+                .children(rows)
+                .child(
+                    Button::new("time-agnostic-add-window", "Add Time Window")
+                        .style(ButtonStyle::Outlined)
+                        .label_size(LabelSize::Small)
+                        .start_icon(Icon::new(IconName::Plus).size(IconSize::Small))
+                        .on_click(|_event, _window, cx| add_time_agnostic_entry(cx)),
+                ),
+        )
+        .into_any_element()
+}
+
+fn render_time_agnostic_row(
+    index: usize,
+    entry: TimeAgnosticLadderEntryContent,
+    window: &mut Window,
+    cx: &mut Context<SettingsWindow>,
+) -> AnyElement {
+    let start = entry.start.clone().unwrap_or_default();
+    let end = entry.end.clone().unwrap_or_default();
+    let selected_model = entry.model;
+
+    h_flex()
+        .w_full()
+        .gap_1()
+        .items_center()
+        .child(
+            SettingsInputField::new(format!("time-agnostic-start-{index}"))
+                .with_initial_text(start)
+                .with_placeholder("HH:MM")
+                .on_confirm(move |new_start, _window, cx| {
+                    let Some(new_start) = new_start else {
+                        return;
+                    };
+                    let new_start = new_start.trim().to_string();
+                    if new_start.is_empty() {
+                        return;
+                    }
+                    update_time_agnostic_ladder_entry(cx, index, move |entry| {
+                        entry.start = Some(new_start);
+                    });
+                }),
+        )
+        .child(
+            SettingsInputField::new(format!("time-agnostic-end-{index}"))
+                .with_initial_text(end)
+                .with_placeholder("HH:MM")
+                .on_confirm(move |new_end, _window, cx| {
+                    let Some(new_end) = new_end else {
+                        return;
+                    };
+                    let new_end = new_end.trim().to_string();
+                    if new_end.is_empty() {
+                        return;
+                    }
+                    update_time_agnostic_ladder_entry(cx, index, move |entry| {
+                        entry.end = Some(new_end);
+                    });
+                }),
+        )
+        .child(render_time_agnostic_model_dropdown(index, selected_model, window, cx))
+        .child(
+            IconButton::new(format!("time-agnostic-remove-{index}"), IconName::Trash)
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Muted)
+                .tooltip(Tooltip::text("Remove Time Window"))
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    remove_time_agnostic_entry(index, cx);
+                })),
+        )
+        .into_any_element()
+}
+
+fn render_time_agnostic_model_dropdown(
+    index: usize,
+    selected: Option<LanguageModelSelection>,
+    window: &mut Window,
+    cx: &mut Context<SettingsWindow>,
+) -> AnyElement {
+    let label: SharedString = selected
+        .as_ref()
+        .map(|selection| format!("{}/{}", selection.provider.0, selection.model).into())
+        .unwrap_or_else(|| "Select model…".into());
+
+    let menu = ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
+        for provider in LanguageModelRegistry::read_global(_cx).providers() {
+            for model in provider.provided_models(_cx) {
+                let selection = LanguageModelSelection {
+                    provider: LanguageModelProviderSetting(provider.id().0.to_string()),
+                    model: model.id().0.to_string(),
+                    enable_thinking: false,
+                    effort: None,
+                    speed: None,
+                };
+                let entry_label = format!("{} / {}", provider.name().0, model.name().0);
+                menu.push_item(
+                    ui::ContextMenuEntry::new(entry_label).handler(move |_window, cx| {
+                        let selection = selection.clone();
+                        update_time_agnostic_ladder_entry(cx, index, move |entry| {
+                            entry.model = Some(selection);
+                        });
+                    }),
+                );
+            }
+        }
+        menu
+    });
+
+    DropdownMenu::new(
+        ElementId::Name(format!("time-agnostic-model-{index}").into()),
+        label,
+        menu,
+    )
+    .style(DropdownStyle::Outlined)
+    .trigger_size(ButtonSize::Compact)
+    .aria_label("Time window model")
+    .into_any_element()
+}
+
+fn set_time_agnostic_enabled(value: bool, cx: &mut App) {
+    SettingsStore::global(cx).update_settings_file(<dyn fs::Fs>::global(cx), move |settings, _| {
+        settings
+            .agent
+            .get_or_insert_default()
+            .time_agnostic
+            .get_or_insert_default()
+            .enabled = Some(value);
+    });
+}
+
+fn add_time_agnostic_entry(cx: &mut App) {
+    SettingsStore::global(cx).update_settings_file(<dyn fs::Fs>::global(cx), move |settings, _| {
+        settings
+            .agent
+            .get_or_insert_default()
+            .time_agnostic
+            .get_or_insert_default()
+            .ladder
+            .get_or_insert_default()
+            .push(TimeAgnosticLadderEntryContent {
+                start: Some("09:00".into()),
+                end: Some("17:00".into()),
+                model: None,
+            });
+    });
+}
+
+fn remove_time_agnostic_entry(index: usize, cx: &mut App) {
+    SettingsStore::global(cx).update_settings_file(<dyn fs::Fs>::global(cx), move |settings, _| {
+        let agent = settings.agent.get_or_insert_default();
+        let Some(ladder) = agent
+            .time_agnostic
+            .as_mut()
+            .and_then(|ta| ta.ladder.as_mut())
+        else {
+            return;
+        };
+        if index < ladder.len() {
+            ladder.remove(index);
+        }
+    });
+}
+
+fn update_time_agnostic_ladder_entry(
+    cx: &mut App,
+    index: usize,
+    update: impl 'static + Send + FnOnce(&mut TimeAgnosticLadderEntryContent),
+) {
+    SettingsStore::global(cx).update_settings_file(<dyn fs::Fs>::global(cx), move |settings, _| {
+        let agent = settings.agent.get_or_insert_default();
+        let Some(ladder) = agent
+            .time_agnostic
+            .as_mut()
+            .and_then(|ta| ta.ladder.as_mut())
+        else {
+            return;
+        };
+        let Some(entry) = ladder.get_mut(index) else {
+            return;
+        };
+        update(entry);
+    });
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

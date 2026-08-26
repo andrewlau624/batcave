@@ -1773,13 +1773,18 @@ impl Thread {
         let model = match (resolved_saved_model, saved_selection) {
             (Some(model), _) => ThreadModel::Ready(model),
             (None, Some(selection)) => ThreadModel::Unresolved(selection),
-            (None, None) => Self::resolve_profile_model(&profile_id, cx)
-                .or_else(|| {
-                    LanguageModelRegistry::global(cx).update(cx, |registry, _cx| {
-                        registry.default_model().map(|model| model.model)
-                    })
-                })
-                .map_or(ThreadModel::Unset, ThreadModel::Ready),
+            (None, None) => {
+                let model = AgentSettings::get_global(cx)
+                    .time_agnostic_model(cx)
+                    .map(|configured| configured.model)
+                    .or_else(|| Self::resolve_profile_model(&profile_id, cx))
+                    .or_else(|| {
+                        LanguageModelRegistry::global(cx).update(cx, |registry, _cx| {
+                            registry.default_model().map(|model| model.model)
+                        })
+                    });
+                model.map_or(ThreadModel::Unset, ThreadModel::Ready)
+            }
         };
 
         let (prompt_capabilities_tx, prompt_capabilities_rx) = watch::channel(

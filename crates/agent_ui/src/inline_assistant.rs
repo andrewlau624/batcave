@@ -220,7 +220,10 @@ impl InlineAssistant {
 
         let configuration_error = |cx| {
             let model_registry = LanguageModelRegistry::read_global(cx);
-            model_registry.configuration_error(model_registry.inline_assistant_model(), cx)
+            model_registry.configuration_error(
+                AgentSettings::get_global(cx).inline_assistant_model_time_aware(cx),
+                cx,
+            )
         };
 
         let Some(agent_panel) = workspace.panel::<AgentPanel>(cx) else {
@@ -402,7 +405,7 @@ impl InlineAssistant {
 
             codegen_ranges.push(anchor_range);
 
-            if let Some(model) = LanguageModelRegistry::read_global(cx).inline_assistant_model() {
+            if let Some(model) = AgentSettings::get_global(cx).inline_assistant_model_time_aware(cx) {
                 telemetry::event!(
                     "Assistant Invoked",
                     kind = "inline",
@@ -975,7 +978,7 @@ impl InlineAssistant {
             }
 
             let active_alternative = assist.codegen.read(cx).active_alternative().clone();
-            if let Some(model) = LanguageModelRegistry::read_global(cx).inline_assistant_model() {
+            if let Some(model) = AgentSettings::get_global(cx).inline_assistant_model_time_aware(cx) {
                 let language_name = assist.editor.upgrade().and_then(|editor| {
                     let multibuffer = editor.read(cx).buffer().read(cx);
                     let snapshot = multibuffer.snapshot(cx);
@@ -1246,7 +1249,7 @@ impl InlineAssistant {
         }
 
         let Some(ConfiguredModel { model, .. }) =
-            LanguageModelRegistry::read_global(cx).inline_assistant_model()
+            AgentSettings::get_global(cx).inline_assistant_model_time_aware(cx)
         else {
             return;
         };

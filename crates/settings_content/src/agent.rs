@@ -271,6 +271,9 @@ pub struct AgentSettingsContent {
     pub default_profile: Option<Arc<str>>,
     /// The available agent profiles.
     pub profiles: Option<IndexMap<Arc<str>, AgentProfileContent>>,
+    /// Time-based model routing. When enabled, new threads and inline
+    /// assists use the model configured for the current time window.
+    pub time_agnostic: Option<TimeAgnosticSettingsContent>,
     /// Where to show a popup notification when the agent is waiting for user input.
     ///
     /// Default: "primary_screen"
@@ -531,6 +534,24 @@ pub struct AgentProfileContent {
     pub context_servers: IndexMap<Arc<str>, ContextServerPresetContent>,
     /// The default language model selected when using this profile.
     pub default_model: Option<LanguageModelSelection>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq)]
+pub struct TimeAgnosticSettingsContent {
+    /// Master switch for time-based model routing.
+    pub enabled: Option<bool>,
+    /// Time windows, each with the model to route to during it.
+    pub ladder: Option<Vec<TimeAgnosticLadderEntryContent>>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq)]
+pub struct TimeAgnosticLadderEntryContent {
+    /// Start time in 24-hour "HH:MM" format.
+    pub start: Option<String>,
+    /// End time in 24-hour "HH:MM" format.
+    pub end: Option<String>,
+    /// The model to route to during this window.
+    pub model: Option<LanguageModelSelection>,
 }
 
 #[with_fallible_options]

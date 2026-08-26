@@ -543,7 +543,7 @@ impl ModelUsageContext {
     pub fn configured_model(&self, cx: &App) -> Option<ConfiguredModel> {
         match self {
             Self::InlineAssistant => {
-                LanguageModelRegistry::read_global(cx).inline_assistant_model()
+                AgentSettings::get_global(cx).inline_assistant_model_time_aware(cx)
             }
         }
     }
@@ -995,6 +995,7 @@ mod tests {
             favorite_models: vec![],
             default_profile: AgentProfileId::default(),
             profiles: Default::default(),
+            time_agnostic: agent_settings::TimeAgnosticSettings::default(),
             notify_when_agent_waiting: NotifyWhenAgentWaiting::default(),
             play_sound_when_agent_done: PlaySoundWhenAgentDone::Never,
             single_file_review: false,

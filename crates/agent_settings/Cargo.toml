@@ -13,6 +13,7 @@ path = "src/agent_settings.rs"
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
 collections.workspace = true
 convert_case.workspace = true
 fs.workspace = true
@@ -26,6 +27,7 @@ regex.workspace = true
 schemars.workspace = true
 serde.workspace = true
 settings.workspace = true
+settings_content.workspace = true
 util.workspace = true
 
 [dev-dependencies]

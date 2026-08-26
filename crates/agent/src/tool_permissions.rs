@@ -588,6 +588,7 @@ mod tests {
             favorite_models: vec![],
             default_profile: AgentProfileId::default(),
             profiles: Default::default(),
+            time_agnostic: agent_settings::TimeAgnosticSettings::default(),
             notify_when_agent_waiting: NotifyWhenAgentWaiting::default(),
             play_sound_when_agent_done: PlaySoundWhenAgentDone::default(),
             single_file_review: false,

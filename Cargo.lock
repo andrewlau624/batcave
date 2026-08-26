@@ -424,6 +424,7 @@ name = "agent_settings"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "collections",
  "convert_case 0.11.0",
  "fs",
@@ -439,6 +440,7 @@ dependencies = [
  "serde_json",
  "serde_json_lenient",
  "settings",
+ "settings_content",
  "util",
 ]
 
@@ -16564,6 +16566,7 @@ dependencies = [
  "serde_json",
  "serde_yaml_ng",
  "settings",
+ "settings_content",
  "shell_command_parser",
  "strum 0.27.2",
  "telemetry",
