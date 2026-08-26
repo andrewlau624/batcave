@@ -276,6 +276,12 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
         _ = (workspace_id, window, cx);
         unimplemented!("clone_on_split() must be implemented if can_split() returns true")
     }
+    /// Whether closing this item would kill a running process (e.g. a
+    /// terminal with a live shell). Windows prompt before closing when any
+    /// item reports `true`.
+    fn is_running_process(&self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
+        false
+    }
     fn is_dirty(&self, _: &App) -> bool {
         false
     }
@@ -528,6 +534,8 @@ pub trait ItemHandle: 'static + Send {
     fn navigate(&self, data: Arc<dyn Any + Send>, window: &mut Window, cx: &mut App) -> bool;
     fn item_id(&self) -> EntityId;
     fn to_any_view(&self) -> AnyView;
+    fn is_running_process(&self, window: &mut Window, cx: &mut App) -> bool;
+
     fn is_dirty(&self, cx: &App) -> bool;
     fn capability(&self, cx: &App) -> Capability;
     fn toggle_read_only(&self, window: &mut Window, cx: &mut App);
@@ -1036,6 +1044,10 @@ impl<T: Item> ItemHandle for Entity<T> {
 
     fn to_any_view(&self) -> AnyView {
         self.clone().into()
+    }
+
+    fn is_running_process(&self, window: &mut Window, cx: &mut App) -> bool {
+        self.update(cx, |this, cx| this.is_running_process(window, cx))
     }
 
     fn is_dirty(&self, cx: &App) -> bool {

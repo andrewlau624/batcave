@@ -1440,6 +1440,9 @@ impl Render for TerminalView {
 impl Item for TerminalView {
     type Event = ItemEvent;
 
+    fn is_running_process(&self, _window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.terminal.read(cx).is_running()
+    }
     fn tab_tooltip_content(&self, cx: &App) -> Option<TabTooltipContent> {
         Some(TabTooltipContent::Custom(Box::new(Tooltip::element({
             let terminal = self.terminal().read(cx);

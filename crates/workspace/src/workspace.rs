@@ -3461,6 +3461,40 @@ impl Workspace {
                 }
             }
 
+            // Closing a window or quitting kills any running terminal
+            // processes, so confirm before doing so.
+            if close_intent == CloseIntent::CloseWindow || close_intent == CloseIntent::Quit {
+                let has_running_process = this.update_in(cx, |this, window, cx| {
+                    let items: Vec<_> = this
+                        .panes()
+                        .iter()
+                        .flat_map(|pane| pane.read(cx).items().map(|item| item.boxed_clone()))
+                        .collect();
+                    items
+                        .iter()
+                        .any(|item| item.is_running_process(window, cx))
+                })?;
+                if has_running_process {
+                    let confirm_label = if close_intent == CloseIntent::Quit {
+                        "Quit and Kill"
+                    } else {
+                        "Close and Kill"
+                    };
+                    let answer = cx.update(|window, cx| {
+                        window.prompt(
+                            PromptLevel::Warning,
+                            "Terminals are still running. Closing this window will kill them.",
+                            None,
+                            &[confirm_label, "Cancel"],
+                            cx,
+                        )
+                    })?;
+                    if answer.await.log_err() != Some(0) {
+                        return anyhow::Ok(false);
+                    }
+                }
+            }
+
             // Hot-exit silently writes dirty buffers to the DB; only allow it
             // if the workspace will be reachable again, either via session
             // restore or by reopening its folder paths. Otherwise prompt, so

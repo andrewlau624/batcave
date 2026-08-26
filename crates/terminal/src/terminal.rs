@@ -2977,6 +2977,11 @@ impl Terminal {
         }
     }
 
+    /// Whether the terminal's child process is still running.
+    pub fn is_running(&self) -> bool {
+        self.child_exited.is_none()
+    }
+
     pub fn task(&self) -> Option<&TaskState> {
         self.task.as_ref()
     }
