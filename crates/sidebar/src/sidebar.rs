@@ -2780,6 +2780,22 @@ impl Sidebar {
                                         .with_rotate_animation(2),
                                 )
                             })
+                            .when_some(row.workspace.clone(), |this, workspace| {
+                                this.child(
+                                    IconButton::new(
+                                        SharedString::from(format!(
+                                            "worktree-row-new-thread-{ix}"
+                                        )),
+                                        IconName::Plus,
+                                    )
+                                    .icon_size(IconSize::Small)
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text("New Agent Thread"))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.create_new_entry(&workspace, window, cx);
+                                    })),
+                                )
+                            })
                             .when_some(row.workspace, |this, workspace| {
                                 this.child(
                                     PopoverMenu::new(SharedString::from(format!(
