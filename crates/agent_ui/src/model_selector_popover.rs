@@ -1,4 +1,5 @@
 use std::rc::Rc;
+use std::sync::Arc;
 
 use acp_thread::{AgentModelIcon, AgentModelInfo, AgentModelSelector};
 use gpui::{Entity, FocusHandle};
@@ -16,14 +17,24 @@ pub struct ModelSelectorPopover {
 impl ModelSelectorPopover {
     pub(crate) fn new(
         selector: Rc<dyn AgentModelSelector>,
+        is_time_agnostic: Option<Arc<dyn Fn(&App) -> bool + 'static>>,
+        on_time_agnostic_changed: Option<Arc<dyn Fn(bool, &mut App) + 'static>>,
         menu_handle: PopoverMenuHandle<ModelSelector>,
         focus_handle: FocusHandle,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         Self {
-            selector: cx
-                .new(move |cx| acp_model_selector(selector, focus_handle.clone(), window, cx)),
+            selector: cx.new(move |cx| {
+                acp_model_selector(
+                    selector,
+                    is_time_agnostic,
+                    on_time_agnostic_changed,
+                    focus_handle.clone(),
+                    window,
+                    cx,
+                )
+            }),
             menu_handle,
         }
     }
@@ -47,12 +58,20 @@ impl Render for ModelSelectorPopover {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let selector = self.selector.read(cx);
         let model = selector.delegate.active_model();
-        let model_name = model
-            .as_ref()
-            .map(|model| model.name.clone())
-            .unwrap_or_else(|| SharedString::from("Select a Model"));
-
-        let model_icon = model.as_ref().and_then(|model| model.icon.clone());
+        let (model_name, model_icon) = if selector.delegate.time_agnostic {
+            (
+                SharedString::from("Time Agnostic"),
+                Some(AgentModelIcon::Named(IconName::Clock)),
+            )
+        } else {
+            (
+                model
+                    .as_ref()
+                    .map(|model| model.name.clone())
+                    .unwrap_or_else(|| SharedString::from("Select a Model")),
+                model.as_ref().and_then(|model| model.icon.clone()),
+            )
+        };
 
         let (color, icon) = if self.menu_handle.is_deployed() {
             (Color::Accent, IconName::ChevronUp)

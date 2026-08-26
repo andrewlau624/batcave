@@ -4,6 +4,7 @@ use acp_thread::{
     AgentModelIcon, AgentModelId, AgentModelInfo, AgentModelList, AgentModelSelector,
 };
 
+use agent_settings::AgentSettings;
 use anyhow::Result;
 use collections::{HashSet, IndexMap};
 use futures::FutureExt;
@@ -13,12 +14,13 @@ use gpui::{
     TaskExt, WeakEntity,
 };
 use itertools::Itertools;
+use language_model::DisabledReason;
 use ordered_float::OrderedFloat;
 use picker::{Picker, PickerDelegate};
-use settings::SettingsStore;
+use settings::{Settings as _, SettingsStore};
 use ui::{DocumentationAside, IntoElement, prelude::*};
 use util::ResultExt;
-use zed_actions::agent::OpenSettings;
+use zed_actions::{OpenSettingsAt, agent::OpenSettings};
 
 use crate::ui::{
     ModelSelectorFooter, ModelSelectorHeader, ModelSelectorListItem, documentation_aside_side,
@@ -28,11 +30,20 @@ pub type ModelSelector = Picker<ModelPickerDelegate>;
 
 pub fn acp_model_selector(
     selector: Rc<dyn AgentModelSelector>,
+    is_time_agnostic: Option<Arc<dyn Fn(&App) -> bool + 'static>>,
+    on_time_agnostic_changed: Option<Arc<dyn Fn(bool, &mut App) + 'static>>,
     focus_handle: FocusHandle,
     window: &mut Window,
     cx: &mut Context<ModelSelector>,
 ) -> ModelSelector {
-    let delegate = ModelPickerDelegate::new(selector, focus_handle, window, cx);
+    let delegate = ModelPickerDelegate::new(
+        selector,
+        is_time_agnostic,
+        on_time_agnostic_changed,
+        focus_handle,
+        window,
+        cx,
+    );
     Picker::list(delegate, window, cx)
         .show_scrollbar(true)
         .initial_width(rems(20.))
@@ -41,6 +52,7 @@ pub fn acp_model_selector(
 enum ModelPickerEntry {
     Separator(SharedString),
     Model(AgentModelInfo, bool),
+    TimeAgnostic,
 }
 
 pub struct ModelPickerDelegate {
@@ -51,6 +63,9 @@ pub struct ModelPickerDelegate {
     selected_description: Option<(usize, SharedString)>,
     selected_model: Option<AgentModelInfo>,
     favorites: HashSet<AgentModelId>,
+    pub(crate) time_agnostic: bool,
+    is_time_agnostic: Option<Arc<dyn Fn(&App) -> bool + 'static>>,
+    on_time_agnostic_changed: Option<Arc<dyn Fn(bool, &mut App) + 'static>>,
     _refresh_models_task: Task<()>,
     _settings_subscription: Subscription,
     focus_handle: FocusHandle,
@@ -59,10 +74,17 @@ pub struct ModelPickerDelegate {
 impl ModelPickerDelegate {
     fn new(
         selector: Rc<dyn AgentModelSelector>,
+        is_time_agnostic: Option<Arc<dyn Fn(&App) -> bool + 'static>>,
+        on_time_agnostic_changed: Option<Arc<dyn Fn(bool, &mut App) + 'static>>,
         focus_handle: FocusHandle,
         window: &mut Window,
         cx: &mut Context<ModelSelector>,
     ) -> Self {
+        let time_agnostic = is_time_agnostic
+            .as_ref()
+            .map(|is_time_agnostic| is_time_agnostic(cx))
+            .unwrap_or(false);
+        let is_time_agnostic_for_later = is_time_agnostic.clone();
         let rx = selector.watch(cx);
         let refresh_models_task = {
             cx.spawn_in(window, {
@@ -119,6 +141,9 @@ impl ModelPickerDelegate {
             selected_index: 0,
             selected_description: None,
             favorites,
+            time_agnostic,
+            is_time_agnostic: is_time_agnostic_for_later,
+            on_time_agnostic_changed,
             _refresh_models_task: refresh_models_task,
             _settings_subscription: settings_subscription,
             focus_handle,
@@ -210,7 +235,7 @@ impl PickerDelegate for ModelPickerDelegate {
 
     fn can_select(&self, ix: usize, _window: &mut Window, _cx: &mut Context<Picker<Self>>) -> bool {
         match self.filtered_entries.get(ix) {
-            Some(ModelPickerEntry::Model(_, _)) => true,
+            Some(ModelPickerEntry::Model(_, _)) | Some(ModelPickerEntry::TimeAgnostic) => true,
             Some(ModelPickerEntry::Separator(_)) | None => false,
         }
     }
@@ -242,23 +267,35 @@ impl PickerDelegate for ModelPickerDelegate {
             };
 
             this.update_in(cx, |this, window, cx| {
-                this.delegate.filtered_entries =
-                    info_list_to_picker_entries(filtered_models, &favorites);
-                // Finds the currently selected model in the list
-                let new_index = this
+                this.delegate.time_agnostic = this
                     .delegate
-                    .selected_model
+                    .is_time_agnostic
                     .as_ref()
-                    .and_then(|selected| {
-                        this.delegate.filtered_entries.iter().position(|entry| {
-                            if let ModelPickerEntry::Model(model_info, _) = entry {
-                                model_info.id == selected.id
-                            } else {
-                                false
-                            }
+                    .map(|is_time_agnostic| is_time_agnostic(cx))
+                    .unwrap_or(false);
+                this.delegate.filtered_entries = {
+                    let mut entries = vec![ModelPickerEntry::TimeAgnostic];
+                    entries.extend(info_list_to_picker_entries(filtered_models, &favorites));
+                    entries
+                };
+                // Finds the currently selected model in the list
+                let new_index = if this.delegate.time_agnostic {
+                    0
+                } else {
+                    this.delegate
+                        .selected_model
+                        .as_ref()
+                        .and_then(|selected| {
+                            this.delegate.filtered_entries.iter().position(|entry| {
+                                if let ModelPickerEntry::Model(model_info, _) = entry {
+                                    model_info.id == selected.id
+                                } else {
+                                    false
+                                }
+                            })
                         })
-                    })
-                    .unwrap_or(0);
+                        .unwrap_or(0)
+                };
                 this.set_selected_index(new_index, Some(picker::Direction::Down), true, window, cx);
                 cx.notify();
             })
@@ -267,18 +304,44 @@ impl PickerDelegate for ModelPickerDelegate {
     }
 
     fn confirm(&mut self, _secondary: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
-        if let Some(ModelPickerEntry::Model(model_info, _)) =
-            self.filtered_entries.get(self.selected_index)
-            && model_info.disabled.is_none()
-        {
-            self.selector
-                .select_model(model_info.id.clone(), cx)
-                .detach_and_log_err(cx);
-            self.selected_model = Some(model_info.clone());
-            let current_index = self.selected_index;
-            self.set_selected_index(current_index, window, cx);
+        match self.filtered_entries.get(self.selected_index) {
+            Some(ModelPickerEntry::TimeAgnostic) => {
+                let settings = AgentSettings::get_global(cx);
+                let ladder_ready =
+                    settings.time_agnostic.enabled && !settings.time_agnostic.ladder.is_empty();
+                if ladder_ready {
+                    if let Some(on_time_agnostic_changed) = &self.on_time_agnostic_changed {
+                        on_time_agnostic_changed(true, cx);
+                    }
+                    self.time_agnostic = true;
+                    cx.emit(DismissEvent);
+                } else {
+                    window.dispatch_action(
+                        Box::new(OpenSettingsAt {
+                            path: "llm_providers".into(),
+                            target: None,
+                        }),
+                        cx,
+                    );
+                }
+            }
+            Some(ModelPickerEntry::Model(model_info, _)) if model_info.disabled.is_none() => {
+                if self.time_agnostic {
+                    if let Some(on_time_agnostic_changed) = &self.on_time_agnostic_changed {
+                        on_time_agnostic_changed(false, cx);
+                    }
+                    self.time_agnostic = false;
+                }
+                self.selector
+                    .select_model(model_info.id.clone(), cx)
+                    .detach_and_log_err(cx);
+                self.selected_model = Some(model_info.clone());
+                let current_index = self.selected_index;
+                self.set_selected_index(current_index, window, cx);
 
-            cx.emit(DismissEvent);
+                cx.emit(DismissEvent);
+            }
+            _ => {}
         }
     }
 
@@ -299,8 +362,37 @@ impl PickerDelegate for ModelPickerDelegate {
             ModelPickerEntry::Separator(title) => {
                 Some(ModelSelectorHeader::new(title, ix > 1).into_any_element())
             }
+            ModelPickerEntry::TimeAgnostic => {
+                let settings = AgentSettings::get_global(cx);
+                let ladder_ready =
+                    settings.time_agnostic.enabled && !settings.time_agnostic.ladder.is_empty();
+                let ladder_model = settings
+                    .time_agnostic_model(cx)
+                    .map(|model| model.model.name().0);
+
+                Some(
+                    div()
+                        .id(("model-picker-time-agnostic", ix))
+                        .child(
+                            ModelSelectorListItem::new(ix, "Time Agnostic")
+                                .icon(IconName::Clock)
+                                .is_selected(self.time_agnostic)
+                                .is_focused(selected)
+                                .cost_info(ladder_model)
+                                .disabled(if ladder_ready {
+                                    None
+                                } else {
+                                    Some(DisabledReason(
+                                        "Enable and configure time-agnostic routing in Settings → LLM Providers. Selecting opens settings."
+                                            .into(),
+                                    ))
+                                }),
+                        )
+                        .into_any_element(),
+                )
+            }
             ModelPickerEntry::Model(model_info, is_favorite) => {
-                let is_selected = Some(model_info) == self.selected_model.as_ref();
+                let is_selected = !self.time_agnostic && Some(model_info) == self.selected_model.as_ref();
 
                 let is_favorite = *is_favorite;
                 let handle_action_click = {
@@ -585,7 +677,7 @@ mod tests {
             let model_selector = model_selector.clone();
             move |window, cx| {
                 let selector: Rc<dyn AgentModelSelector> = model_selector;
-                acp_model_selector(selector, cx.focus_handle(), window, cx)
+                acp_model_selector(selector, None, None, cx.focus_handle(), window, cx)
             }
         });
         cx.run_until_parked();
@@ -665,6 +757,7 @@ mod tests {
             .map(|entry| match entry {
                 ModelPickerEntry::Model(info, _) => info.id.as_ref(),
                 ModelPickerEntry::Separator(s) => &s,
+                ModelPickerEntry::TimeAgnostic => "time-agnostic",
             })
             .collect()
     }

@@ -1324,6 +1324,24 @@ impl ConversationView {
                 cx.new(|cx| {
                     ModelSelectorPopover::new(
                         selector,
+                        {
+                            let native_thread = self.as_native_thread(cx);
+                            Some(Arc::new(move |cx: &App| {
+                                native_thread
+                                    .as_ref()
+                                    .is_some_and(|thread| thread.read(cx).is_time_agnostic())
+                            }))
+                        },
+                        {
+                            let native_thread = self.as_native_thread(cx);
+                            Some(Arc::new(move |enabled: bool, cx: &mut App| {
+                                if let Some(thread) = native_thread.as_ref() {
+                                    thread.update(cx, |thread, cx| {
+                                        thread.set_time_agnostic(enabled, cx);
+                                    });
+                                }
+                            }))
+                        },
                         PopoverMenuHandle::default(),
                         self.focus_handle(cx),
                         window,

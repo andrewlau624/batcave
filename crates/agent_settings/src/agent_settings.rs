@@ -309,7 +309,10 @@ impl AgentSettings {
                 else {
                     return false;
                 };
-                if start <= end {
+                if start == end {
+                    // A rung that starts and ends at the same time covers the whole day.
+                    true
+                } else if start <= end {
                     minutes >= start && minutes < end
                 } else {
                     minutes >= start || minutes < end

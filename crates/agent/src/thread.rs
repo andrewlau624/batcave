@@ -1296,6 +1296,7 @@ pub struct Thread {
     project_context: Entity<ProjectContext>,
     pub(crate) templates: Arc<Templates>,
     model: ThreadModel,
+    time_agnostic: bool,
     summarization_model: Option<Arc<dyn LanguageModel>>,
     thinking_enabled: bool,
     thinking_effort: Option<String>,
@@ -1439,6 +1440,7 @@ impl Thread {
             project_context,
             templates,
             model,
+            time_agnostic: AgentSettings::get_global(cx).time_agnostic.enabled,
             summarization_model: None,
             thinking_enabled: enable_thinking,
             speed,
@@ -1773,18 +1775,13 @@ impl Thread {
         let model = match (resolved_saved_model, saved_selection) {
             (Some(model), _) => ThreadModel::Ready(model),
             (None, Some(selection)) => ThreadModel::Unresolved(selection),
-            (None, None) => {
-                let model = AgentSettings::get_global(cx)
-                    .time_agnostic_model(cx)
-                    .map(|configured| configured.model)
-                    .or_else(|| Self::resolve_profile_model(&profile_id, cx))
-                    .or_else(|| {
-                        LanguageModelRegistry::global(cx).update(cx, |registry, _cx| {
-                            registry.default_model().map(|model| model.model)
-                        })
-                    });
-                model.map_or(ThreadModel::Unset, ThreadModel::Ready)
-            }
+            (None, None) => Self::resolve_profile_model(&profile_id, cx)
+                .or_else(|| {
+                    LanguageModelRegistry::global(cx).update(cx, |registry, _cx| {
+                        registry.default_model().map(|model| model.model)
+                    })
+                })
+                .map_or(ThreadModel::Unset, ThreadModel::Ready),
         };
 
         let (prompt_capabilities_tx, prompt_capabilities_rx) = watch::channel(
@@ -1822,6 +1819,7 @@ impl Thread {
             project_context,
             templates,
             model,
+            time_agnostic: AgentSettings::get_global(cx).time_agnostic.enabled,
             summarization_model: None,
             thinking_enabled: db_thread.thinking_enabled,
             thinking_effort: db_thread.thinking_effort,
@@ -2003,6 +2001,20 @@ impl Thread {
 
     pub fn thread_model(&self) -> &ThreadModel {
         &self.model
+    }
+
+    /// Whether this thread resolves its model from the time-agnostic ladder
+    /// at request time instead of using a fixed model.
+    pub fn is_time_agnostic(&self) -> bool {
+        self.time_agnostic
+    }
+
+    pub fn set_time_agnostic(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.time_agnostic == enabled {
+            return;
+        }
+        self.time_agnostic = enabled;
+        cx.notify();
     }
 
     pub(crate) fn ensure_model(
@@ -4051,9 +4063,15 @@ impl Thread {
                 completion_intent
             };
 
-        let model = self
-            .model()
-            .ok_or_else(|| anyhow!(NoModelConfiguredError))?;
+        let model = if self.time_agnostic {
+            AgentSettings::get_global(cx)
+                .time_agnostic_model(cx)
+                .map(|configured| configured.model)
+                .or_else(|| self.model().cloned())
+        } else {
+            self.model().cloned()
+        }
+        .ok_or_else(|| anyhow!(NoModelConfiguredError))?;
         let sandboxing_enabled = crate::sandboxing::sandboxing_enabled(cx);
         let tools = if let Some(turn) = self.running_turn.as_ref() {
             turn.tools
@@ -4124,7 +4142,7 @@ impl Thread {
             tools,
             tool_choice: None,
             stop: Vec::new(),
-            temperature: AgentSettings::temperature_for_model(model, cx),
+            temperature: AgentSettings::temperature_for_model(&model, cx),
             // Models that can't run with thinking disabled ignore the
             // toggle state, which may be stale from a previously selected
             // model that could.

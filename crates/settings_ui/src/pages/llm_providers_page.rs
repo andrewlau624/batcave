@@ -13,7 +13,9 @@ use settings::{
     OpenAiCompatibleAvailableModel, OpenAiCompatibleModelCapabilities,
     OpenAiCompatibleSettingsContent, OpenAiReasoningEffort, SettingsStore,
 };
-use settings_content::TimeAgnosticLadderEntryContent;
+use settings_content::{
+    TimeAgnosticLadderEntryContent, TimeAgnosticSettingsContent,
+};
 use ui::{
     ButtonLink, Checkbox, ConfiguredApiCard, ContextMenu, Divider, DividerColor, DropdownMenu,
     DropdownStyle, IconPosition, PopoverMenu, SwitchField, ToggleState, Tooltip, prelude::*,
@@ -92,6 +94,34 @@ fn render_time_agnostic_section(
             .tab_index(0),
         )
         .child(
+            h_flex()
+                .gap_1()
+                .child(
+                    Button::new("time-agnostic-preset-deepseek", "Preset: DeepSeek Off-Peak")
+                        .style(ButtonStyle::Outlined)
+                        .label_size(LabelSize::Small)
+                        .on_click(|_event, _window, cx| {
+                            apply_time_agnostic_preset(TimeAgnosticPreset::DeepSeekOffPeak, cx)
+                        }),
+                )
+                .child(
+                    Button::new("time-agnostic-preset-cheapest", "Preset: Cheapest")
+                        .style(ButtonStyle::Outlined)
+                        .label_size(LabelSize::Small)
+                        .on_click(|_event, _window, cx| {
+                            apply_time_agnostic_preset(TimeAgnosticPreset::CheapestAllDay, cx)
+                        }),
+                )
+                .child(
+                    Button::new("time-agnostic-preset-american", "Preset: American Night")
+                        .style(ButtonStyle::Outlined)
+                        .label_size(LabelSize::Small)
+                        .on_click(|_event, _window, cx| {
+                            apply_time_agnostic_preset(TimeAgnosticPreset::AmericanNight, cx)
+                        }),
+                ),
+        )
+        .child(
             v_flex()
                 .gap_1p5()
                 .children(rows)
@@ -104,6 +134,62 @@ fn render_time_agnostic_section(
                 ),
         )
         .into_any_element()
+}
+
+#[derive(Clone, Copy)]
+enum TimeAgnosticPreset {
+    DeepSeekOffPeak,
+    CheapestAllDay,
+    AmericanNight,
+}
+
+/// The ladder presets hardcode PDT (UTC-7) windows, matching DeepSeek's
+/// peak hours (01:00-04:00 and 06:00-10:00 UTC, Mon-Fri) converted to the
+/// author's local timezone.
+fn apply_time_agnostic_preset(preset: TimeAgnosticPreset, cx: &mut App) {
+    let ladder = match preset {
+        TimeAgnosticPreset::DeepSeekOffPeak => vec![
+            time_agnostic_preset_entry("03:00", "18:00", "opencode-go", "deepseek-v4-flash"),
+            time_agnostic_preset_entry("18:00", "21:00", "opencode-go", "glm-5.3-flash"),
+            time_agnostic_preset_entry("21:00", "23:00", "opencode-go", "deepseek-v4-flash"),
+            time_agnostic_preset_entry("23:00", "03:00", "opencode-go", "glm-5.3-flash"),
+        ],
+        TimeAgnosticPreset::CheapestAllDay => vec![time_agnostic_preset_entry(
+            "00:00", "00:00", "opencode-go", "glm-5.3-flash",
+        )],
+        TimeAgnosticPreset::AmericanNight => vec![
+            time_agnostic_preset_entry("03:00", "18:00", "opencode-go", "deepseek-v4-flash"),
+            time_agnostic_preset_entry("18:00", "21:00", "opencode-go", "gpt-5.6-luna"),
+            time_agnostic_preset_entry("21:00", "23:00", "opencode-go", "deepseek-v4-flash"),
+            time_agnostic_preset_entry("23:00", "03:00", "opencode-go", "gpt-5.6-luna"),
+        ],
+    };
+
+    SettingsStore::global(cx).update_settings_file(<dyn fs::Fs>::global(cx), move |settings, _| {
+        settings.agent.get_or_insert_default().time_agnostic = Some(TimeAgnosticSettingsContent {
+            enabled: Some(true),
+            ladder: Some(ladder),
+        });
+    });
+}
+
+fn time_agnostic_preset_entry(
+    start: &str,
+    end: &str,
+    provider: &str,
+    model: &str,
+) -> TimeAgnosticLadderEntryContent {
+    TimeAgnosticLadderEntryContent {
+        start: Some(start.into()),
+        end: Some(end.into()),
+        model: Some(LanguageModelSelection {
+            provider: LanguageModelProviderSetting(provider.into()),
+            model: model.into(),
+            enable_thinking: false,
+            effort: None,
+            speed: None,
+        }),
+    }
 }
 
 fn render_time_agnostic_row(
