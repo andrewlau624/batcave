@@ -4,7 +4,7 @@
       <img width="150" height="150" alt="Batman" src="https://github.com/user-attachments/assets/c8b82026-6e63-4817-ab98-23695bd3a531" />
     </td>
     <td>
-This repo is a Zed fork personalized for parallelization across multiple repos and worktrees. I named it **`Batcave`** because I like Batman, and having my own code stored in a personal code editor feels like working in my own Batcave.
+This repo is a Zed fork personalized for parallelization across multiple repos and worktrees. I named it "Batcave" because I like Batman, and having my own code stored in a personal code editor feels like working in my own Batcave.
   </td>
   </tr>
 </table>
