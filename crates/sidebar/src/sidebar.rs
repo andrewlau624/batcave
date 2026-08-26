@@ -2704,6 +2704,42 @@ impl Sidebar {
                             }),
                     )
                     .children(section.rows.into_iter().enumerate().map(|(ix, row)| {
+                        // Threads opened in this worktree: match on the
+                        // workspace's own root (falling back to the main
+                        // checkout for the ghost row), so each worktree's
+                        // threads sit directly underneath it.
+                        let row_root: PathBuf = row
+                            .workspace
+                            .as_ref()
+                            .and_then(|workspace| {
+                                workspace
+                                    .read(cx)
+                                    .root_paths(cx)
+                                    .into_iter()
+                                    .next()
+                                    .map(|path| path.to_path_buf())
+                            })
+                            .unwrap_or_else(|| main_path.clone());
+                        let row_threads: Vec<Arc<ThreadEntry>> = self
+                            .contents
+                            .entries
+                            .iter()
+                            .filter_map(|entry| {
+                                let ListEntry::Thread(thread) = entry else {
+                                    return None;
+                                };
+                                let matches_row = thread
+                                    .metadata
+                                    .folder_paths()
+                                    .paths()
+                                    .iter()
+                                    .any(|path| path == &row_root);
+                                matches_row.then(|| thread.clone())
+                            })
+                            .collect::<Vec<_>>();
+                        v_flex()
+                            .w_full()
+                            .child(
                         h_flex()
                             .id(SharedString::from(format!(
                                 "worktree-row-{}-{ix}",
@@ -2887,68 +2923,38 @@ impl Sidebar {
                                     }),
                                 )
                             })
-                            .into_any_element()
+                            .when(!is_section_collapsed, |el| {
+                                el.child(
+                                    v_flex()
+                                        .w_full()
+                                        .pl_3()
+                                        .children(
+                                            row_threads
+                                                .into_iter()
+                                                .enumerate()
+                                                .map(|(thread_ix, thread)| {
+                                                    let is_active = self
+                                                        .active_entry
+                                                        .as_ref()
+                                                        .is_some_and(|active| {
+                                                            active.matches_entry(&ListEntry::Thread(
+                                                                thread.clone(),
+                                                            ))
+                                                        });
+                                                    self.render_thread(
+                                                        WORKTREE_THREAD_OFFSET + thread_ix,
+                                                        &thread,
+                                                        is_active,
+                                                        false,
+                                                        cx,
+                                                    )
+                                                }),
+                                        ),
+                                )
+                            }),
+                    )
+                    .into_any_element()
                     }))
-                    .when(!is_section_collapsed, |el| {
-                        let threads: Vec<Arc<ThreadEntry>> = self
-                            .contents
-                            .entries
-                            .iter()
-                            .filter_map(|entry| {
-                                let ListEntry::Thread(thread) = entry else {
-                                    return None;
-                                };
-                                let matches_section = thread
-                                    .metadata
-                                    .main_worktree_paths()
-                                    .paths()
-                                    .iter()
-                                    .any(|path| path == &main_path)
-                                    || thread
-                                        .metadata
-                                        .folder_paths()
-                                        .paths()
-                                        .iter()
-                                        .any(|path| path.starts_with(&main_path));
-                                matches_section.then(|| thread.clone())
-                            })
-                            .collect::<Vec<_>>();
-
-                        el.child(
-                            v_flex()
-                                .w_full()
-                                .pl_3()
-                                .when(threads.is_empty(), |el| {
-                                    el.child(
-                                        Label::new("No threads")
-                                            .size(LabelSize::Small)
-                                            .color(Color::Muted),
-                                    )
-                                })
-                                .children(
-                                    threads
-                                        .into_iter()
-                                        .enumerate()
-                                        .map(|(thread_ix, thread)| {
-                                            let is_active = self
-                                                .active_entry
-                                                .as_ref()
-                                                .is_some_and(|active| {
-                                                    active.matches_entry(&ListEntry::Thread(
-                                                        thread.clone(),
-                                                    ))
-                                                });
-                                            self.render_thread(
-                                                WORKTREE_THREAD_OFFSET + thread_ix,
-                                                &thread,
-                                                is_active,
-                                                false,
-                                                cx,
-                                            )
-                                        }),
-                                ),
-                        )
-                    })
             }))
             .into_any_element()
     }
