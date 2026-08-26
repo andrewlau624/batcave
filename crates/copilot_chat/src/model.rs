@@ -157,7 +157,8 @@ impl LanguageModel for CopilotChatLanguageModel {
             | CompletionIntent::ThreadContextSummarization
             | CompletionIntent::InlineAssist
             | CompletionIntent::TerminalInlineAssist
-            | CompletionIntent::GenerateGitCommitMessage => true,
+            | CompletionIntent::GenerateGitCommitMessage
+            | CompletionIntent::GenerateDiffAudit => true,
 
             CompletionIntent::Subagent
             | CompletionIntent::ToolResults
@@ -1051,7 +1052,8 @@ fn intent_to_chat_location(intent: Option<CompletionIntent>) -> ChatLocation {
         Some(CompletionIntent::EditFile) => ChatLocation::Agent,
         Some(CompletionIntent::InlineAssist) => ChatLocation::Editor,
         Some(CompletionIntent::TerminalInlineAssist) => ChatLocation::Terminal,
-        Some(CompletionIntent::GenerateGitCommitMessage) => ChatLocation::Other,
+        Some(CompletionIntent::GenerateGitCommitMessage)
+        | Some(CompletionIntent::GenerateDiffAudit) => ChatLocation::Other,
         None => ChatLocation::Panel,
     }
 }

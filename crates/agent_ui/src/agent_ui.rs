@@ -249,6 +249,8 @@ actions!(
         OpenActiveThreadAsMarkdown,
         /// Opens the agent diff view to review changes.
         OpenAgentDiff,
+        /// Runs a cheap AI breakdown of the agent's diff into features and findings.
+        AuditDiff,
         /// Copies the current thread to the clipboard as JSON for debugging.
         CopyThreadToClipboard,
         /// Loads a thread from the clipboard JSON for debugging.

@@ -456,6 +456,7 @@ pub enum CompletionIntent {
     InlineAssist,
     TerminalInlineAssist,
     GenerateGitCommitMessage,
+    GenerateDiffAudit,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]

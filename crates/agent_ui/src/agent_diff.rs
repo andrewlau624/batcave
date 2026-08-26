@@ -1,9 +1,9 @@
-use crate::{Keep, KeepAll, OpenAgentDiff, Reject, RejectAll};
+use crate::{AuditDiff, Keep, KeepAll, OpenAgentDiff, Reject, RejectAll};
 use acp_thread::{AcpThread, AcpThreadEvent};
 use action_log::{ActionLogTelemetry, LastRejectUndo};
 use agent_settings::AgentSettings;
 use anyhow::Result;
-use buffer_diff::DiffHunkStatus;
+use buffer_diff::{DiffHunk, DiffHunkStatus};
 use collections::{HashMap, HashSet};
 use editor::{
     DiffHunkDelegate, Direction, Editor, EditorEvent, EditorSettings, MultiBuffer,
@@ -13,18 +13,27 @@ use editor::{
     scroll::Autoscroll,
 };
 
+use futures::StreamExt;
+
 use gpui::{
     Action, AnyElement, App, AppContext, Empty, Entity, EventEmitter, FocusHandle, Focusable,
     Global, SharedString, Subscription, Task, TaskExt, WeakEntity, Window, prelude::*,
 };
 
 use language::{Buffer, Capability, OffsetRangeExt, Point};
+use language_model::{
+    CompletionIntent, ConfiguredModel, LanguageModelRegistry, LanguageModelRequest,
+    LanguageModelRequestMessage, Role,
+};
+use serde::Deserialize;
+use text::ToOffset;
 use multi_buffer::PathKey;
 use project::{Project, ProjectItem, ProjectPath};
 use settings::{Settings, SettingsStore};
 use std::{
     any::{Any, TypeId},
-    collections::hash_map::Entry,
+    collections::hash_map::{DefaultHasher, Entry},
+    hash::{Hash, Hasher},
     ops::Range,
     sync::Arc,
 };
@@ -44,6 +53,8 @@ pub struct AgentDiffPane {
     thread: Entity<AcpThread>,
     focus_handle: FocusHandle,
     workspace: WeakEntity<Workspace>,
+    audit: DiffAuditState,
+    audit_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -124,6 +135,8 @@ impl AgentDiffPane {
             thread,
             focus_handle,
             workspace,
+            audit: DiffAuditState::default(),
+            audit_task: None,
         };
         this.update_excerpts(window, cx);
         this
@@ -307,6 +320,488 @@ impl AgentDiffPane {
         action_log.update(cx, |action_log, cx| {
             action_log.keep_all_edits(Some(telemetry), cx)
         });
+    }
+
+    fn start_audit(&mut self, _: &AuditDiff, _window: &mut Window, cx: &mut Context<Self>) {
+        let (diff_text, hunks) = self.collect_audit_diff(cx);
+        if diff_text.is_empty() {
+            return;
+        }
+
+        let diff_hash = {
+            let mut hasher = DefaultHasher::new();
+            diff_text.hash(&mut hasher);
+            hasher.finish()
+        };
+
+        if self.audit.diff_hash == diff_hash && self.audit.result.is_some() {
+            self.audit.status = DiffAuditStatus::Done;
+            self.audit.hunks = hunks;
+            cx.notify();
+            return;
+        }
+
+        let Some(ConfiguredModel { provider, model }) =
+            LanguageModelRegistry::read_global(cx).commit_message_model(cx)
+        else {
+            self.audit.status = DiffAuditStatus::Error(
+                "No language model configured. Configure a provider to use diff auditing.".into(),
+            );
+            cx.notify();
+            return;
+        };
+
+        let temperature = AgentSettings::temperature_for_model(&model, cx);
+
+        let content =
+            format!("{DIFF_AUDIT_PROMPT}\n\nHere are the changes to review:\n{diff_text}");
+
+        let request = LanguageModelRequest {
+            thread_id: None,
+            prompt_id: None,
+            intent: Some(CompletionIntent::GenerateDiffAudit),
+            messages: vec![LanguageModelRequestMessage {
+                role: Role::User,
+                content: vec![content.into()],
+                cache: false,
+                reasoning_details: None,
+            }],
+            tools: Vec::new(),
+            tool_choice: None,
+            stop: Vec::new(),
+            temperature,
+            thinking_allowed: false,
+            thinking_effort: None,
+            speed: None,
+            compact_at_tokens: None,
+        };
+
+        self.audit.status = DiffAuditStatus::Running;
+        self.audit.result = None;
+        self.audit.raw_output = None;
+        self.audit.expanded_feature = None;
+        self.audit.diff_hash = diff_hash;
+        self.audit.hunks = hunks;
+
+        self.audit_task = Some(cx.spawn(async move |this, cx| {
+            let result: anyhow::Result<()> = async move {
+                let _defer = cx.on_drop(&this, |this, _cx| {
+                    this.audit_task.take();
+                });
+
+                if let Some(task) = cx.update(|cx| {
+                    if !provider.is_authenticated(cx) {
+                        Some(provider.authenticate(cx))
+                    } else {
+                        None
+                    }
+                }) {
+                    task.await.log_err();
+                }
+
+                let stream = model.stream_completion_text(request, cx);
+                let mut output = String::new();
+                match stream.await {
+                    Ok(mut messages) => {
+                        while let Some(message) = messages.stream.next().await {
+                            match message {
+                                Ok(text) => output.push_str(&text),
+                                Err(error) => {
+                                    this.update(cx, |this, cx| {
+                                        this.audit.status = DiffAuditStatus::Error(format!(
+                                            "Diff audit failed: {error}"
+                                        ));
+                                        cx.notify();
+                                    })?;
+                                    return anyhow::Ok(());
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        this.update(cx, |this, cx| {
+                            this.audit.status =
+                                DiffAuditStatus::Error(format!("Diff audit failed: {error}"));
+                            cx.notify();
+                        })?;
+                        return anyhow::Ok(());
+                    }
+                }
+
+                let parsed = parse_audit_response(&output);
+                this.update(cx, |this, cx| {
+                    match parsed {
+                        Some(result) => {
+                            this.audit.status = DiffAuditStatus::Done;
+                            this.audit.result = Some(result);
+                        }
+                        None => {
+                            this.audit.status = DiffAuditStatus::Done;
+                            this.audit.raw_output = Some(output);
+                        }
+                    }
+                    cx.notify();
+                })?;
+
+                anyhow::Ok(())
+            }
+            .await;
+
+            if let Err(error) = result {
+                log::error!("diff audit failed: {error}");
+            }
+        }));
+    }
+
+    fn collect_audit_diff(&self, cx: &Context<Self>) -> (String, Vec<DiffAuditHunk>) {
+        let changed_buffers = self
+            .thread
+            .read(cx)
+            .action_log()
+            .read(cx)
+            .changed_buffers(cx);
+        let mut sorted_buffers: Vec<_> = changed_buffers.collect();
+        sorted_buffers.sort_by(|(buffer_a, _), (buffer_b, _)| {
+            let path_a = buffer_a.read(cx).file().map(|f| f.path().clone());
+            let path_b = buffer_b.read(cx).file().map(|f| f.path().clone());
+            path_a.cmp(&path_b)
+        });
+
+        const MAX_DIFF_BYTES: usize = 40_000;
+        let mut diff_text = String::new();
+        let mut hunks = Vec::new();
+
+        for (buffer, diff_handle) in sorted_buffers {
+            let Some(path) = buffer
+                .read(cx)
+                .file()
+                .map(|file| file.path().to_string())
+            else {
+                continue;
+            };
+            let snapshot = buffer.read(cx).snapshot();
+            let diff_snapshot = diff_handle.read(cx).snapshot(cx);
+            for (index_in_buffer, hunk_text) in diff_snapshot
+                .hunks_intersecting_range(
+                    language::Anchor::min_max_range_for_buffer(snapshot.remote_id()),
+                    &snapshot,
+                )
+                .filter_map(|hunk| non_empty_hunk_text(&snapshot, &hunk))
+                .enumerate()
+            {
+                if diff_text.len() >= MAX_DIFF_BYTES {
+                    diff_text.push_str("[truncated]\n");
+                    return (diff_text, hunks);
+                }
+                let id = hunks.len() + 1;
+                diff_text.push_str(&format!("[HUNK-{id}] {path}\n"));
+                for line in hunk_text.lines() {
+                    diff_text.push('+');
+                    diff_text.push_str(line);
+                    diff_text.push('\n');
+                }
+                hunks.push(DiffAuditHunk {
+                    id,
+                    buffer_id: snapshot.remote_id(),
+                    index_in_buffer,
+                });
+            }
+        }
+
+        (diff_text, hunks)
+    }
+
+    fn reveal_hunk(&mut self, hunk_index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(hunk) = self.audit.hunks.get(hunk_index).cloned() else {
+            return;
+        };
+        let changed_buffers: Vec<_> = self
+            .thread
+            .read(cx)
+            .action_log()
+            .read(cx)
+            .changed_buffers(cx)
+            .collect();
+        for (buffer, diff_handle) in changed_buffers {
+            if buffer.read(cx).snapshot().remote_id() != hunk.buffer_id {
+                continue;
+            }
+            let snapshot = buffer.read(cx).snapshot();
+            let diff_snapshot = diff_handle.read(cx).snapshot(cx);
+            for (index_in_buffer, candidate) in diff_snapshot
+                .hunks_intersecting_range(
+                    language::Anchor::min_max_range_for_buffer(snapshot.remote_id()),
+                    &snapshot,
+                )
+                .filter(|candidate| non_empty_hunk_text(&snapshot, candidate).is_some())
+                .enumerate()
+            {
+                if index_in_buffer == hunk.index_in_buffer {
+                    let rhs_editor = self.editor.read(cx).rhs_editor().clone();
+                    rhs_editor.update(cx, |editor, cx| {
+                        let multibuffer = editor.buffer().read(cx);
+                        let Some(anchor) = multibuffer
+                            .snapshot(cx)
+                            .anchor_in_excerpt(candidate.buffer_range.start)
+                        else {
+                            return;
+                        };
+                        editor.change_selections(Default::default(), window, cx, |selections| {
+                            selections.select_anchor_ranges([anchor..anchor]);
+                        });
+                    });
+                    return;
+                }
+            }
+            return;
+        }
+    }
+
+    fn render_audit_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let header = h_flex()
+            .w_full()
+            .justify_between()
+            .items_center()
+            .px_2()
+            .py_1()
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(
+                        Icon::new(IconName::ListTodo)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new("Diff Audit")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+            )
+            .child(
+                IconButton::new("close-audit", IconName::Close)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Close audit"))
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        this.audit.status = DiffAuditStatus::Idle;
+                        cx.notify();
+                    })),
+            );
+
+        let sidebar = v_flex()
+            .w(px(300.))
+            .h_full()
+            .border_r_1()
+            .border_color(cx.theme().colors().border)
+            .bg(cx.theme().colors().panel_background)
+            .overflow_hidden()
+            .child(header)
+            .child(Divider::horizontal());
+
+        match &self.audit.status {
+            DiffAuditStatus::Idle => Empty.into_any(),
+            DiffAuditStatus::Running => sidebar
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .child(
+                            Icon::new(IconName::LoadCircle)
+                                .size(IconSize::Medium)
+                                .color(Color::Accent)
+                                .with_rotate_animation(3),
+                        )
+                        .child(Label::new("Breaking down changes…").color(Color::Muted)),
+                )
+                .into_any_element(),
+            DiffAuditStatus::Error(message) => sidebar
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .gap_2()
+                        .p_2()
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .items_center()
+                                .child(Icon::new(IconName::Warning).color(Color::Error))
+                                .child(Label::new("Audit failed").color(Color::Error)),
+                        )
+                        .child(
+                            Label::new(message.clone())
+                                .color(Color::Muted)
+                                .size(LabelSize::Small),
+                        )
+                        .child(
+                            Button::new("retry-audit", "Retry").on_click(cx.listener(
+                                |this, _, window, cx| this.start_audit(&AuditDiff, window, cx),
+                            )),
+                        ),
+                )
+                .into_any_element(),
+            DiffAuditStatus::Done => {
+                let features = self
+                    .audit
+                    .result
+                    .as_ref()
+                    .map(|result| result.features.clone())
+                    .unwrap_or_default();
+                let raw_output = self.audit.raw_output.clone();
+                let rows: Vec<AnyElement> = if features.is_empty() {
+                    vec![v_flex()
+                        .gap_1()
+                        .p_2()
+                        .child(Label::new("No features identified").color(Color::Muted))
+                        .when_some(raw_output, |el, raw| {
+                            el.child(Label::new(raw).color(Color::Muted).size(LabelSize::Small))
+                        })
+                        .into_any_element()]
+                } else {
+                    features
+                        .iter()
+                        .enumerate()
+                        .map(|(ix, feature)| self.render_audit_feature(ix, feature, cx))
+                        .collect()
+                };
+                sidebar
+                    .child(
+                        v_flex()
+                            .id("audit-feature-scroll")
+                            .flex_1()
+                            .overflow_y_scroll()
+                            .p_1()
+                            .gap_0p5()
+                            .children(rows),
+                    )
+                    .into_any_element()
+            }
+        }
+    }
+
+    fn render_audit_feature(
+        &self,
+        ix: usize,
+        feature: &DiffAuditFeature,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let is_expanded = self.audit.expanded_feature == Some(ix);
+        let finding_count = feature.findings.len();
+        let hunk_count = feature.hunk_ids.len();
+
+        v_flex()
+            .id(("audit-feature", ix))
+            .child(
+                h_flex()
+                    .id(("audit-feature-row", ix))
+                    .w_full()
+                    .gap_1()
+                    .items_center()
+                    .px_2()
+                    .py_1()
+                    .cursor_pointer()
+                    .hover(|this| this.bg(cx.theme().colors().element_hover))
+                    .on_click(cx.listener(move |this, _, _window, cx| {
+                        this.audit.expanded_feature = if is_expanded { None } else { Some(ix) };
+                        cx.notify();
+                    }))
+                    .child(
+                        Icon::new(if is_expanded {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                    )
+                    .child(Label::new(feature.title.clone()).size(LabelSize::Small))
+                    .child(div().flex_1())
+                    .when(hunk_count > 0, |el| {
+                        el.child(
+                            Label::new(format!("{hunk_count} hunks"))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                    })
+                    .when(finding_count > 0, |el| {
+                        el.child(
+                            h_flex()
+                                .gap_0p5()
+                                .items_center()
+                                .child(
+                                    Icon::new(IconName::Warning)
+                                        .size(IconSize::Small)
+                                        .color(Color::Warning),
+                                )
+                                .child(
+                                    Label::new(finding_count.to_string())
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                ),
+                        )
+                    }),
+            )
+            .when(is_expanded, |el| {
+                el.child(
+                    v_flex()
+                        .gap_1()
+                        .px_2()
+                        .pb_2()
+                        .when(!feature.description.is_empty(), |el| {
+                            el.child(
+                                Label::new(feature.description.clone())
+                                    .color(Color::Muted)
+                                    .size(LabelSize::Small),
+                            )
+                        })
+                        .children(
+                            feature
+                                .findings
+                                .iter()
+                                .enumerate()
+                                .map(|(finding_ix, finding)| {
+                                    self.render_audit_finding(finding_ix, finding, cx)
+                                }),
+                        ),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_audit_finding(
+        &self,
+        finding_ix: usize,
+        finding: &DiffAuditFinding,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (icon, color) = match finding.severity {
+            DiffAuditSeverity::Info => (IconName::Info, Color::Info),
+            DiffAuditSeverity::Warning => (IconName::Warning, Color::Warning),
+            DiffAuditSeverity::Error => (IconName::XCircle, Color::Error),
+        };
+        let hunk_index = finding
+            .hunk_id
+            .and_then(|id| self.audit.hunks.iter().position(|hunk| hunk.id == id));
+
+        h_flex()
+            .id(("audit-finding-row", finding_ix))
+            .w_full()
+            .gap_1()
+            .items_start()
+            .px_1()
+            .py_0p5()
+            .cursor_pointer()
+            .hover(|this| this.bg(cx.theme().colors().element_hover))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if let Some(hunk_index) = hunk_index {
+                    this.reveal_hunk(hunk_index, window, cx);
+                }
+            }))
+            .child(Icon::new(icon).size(IconSize::Small).color(color))
+            .child(Label::new(finding.note.clone()).size(LabelSize::Small))
+            .into_any_element()
     }
 }
 
@@ -696,6 +1191,7 @@ impl Render for AgentDiffPane {
             .on_action(cx.listener(Self::reject))
             .on_action(cx.listener(Self::reject_all))
             .on_action(cx.listener(Self::keep_all))
+            .on_action(cx.listener(Self::start_audit))
             // Only paint the background for the empty state. When the diff editor
             // is shown it already paints `editor_background`; painting it again
             // here double-composites into a darker patch on transparent windows.
@@ -730,8 +1226,128 @@ impl Render for AgentDiffPane {
                         ),
                 )
             })
-            .when(!is_empty, |el| el.child(self.editor.clone()))
+            .when(!is_empty, |el| {
+                el.child(
+                    h_flex()
+                        .size_full()
+                        .child(self.render_audit_sidebar(cx))
+                        .child(self.editor.clone()),
+                )
+            })
     }
+}
+
+#[derive(Default)]
+struct DiffAuditState {
+    status: DiffAuditStatus,
+    result: Option<DiffAuditResult>,
+    raw_output: Option<String>,
+    diff_hash: u64,
+    hunks: Vec<DiffAuditHunk>,
+    expanded_feature: Option<usize>,
+}
+
+#[derive(Default)]
+enum DiffAuditStatus {
+    #[default]
+    Idle,
+    Running,
+    Done,
+    Error(String),
+}
+
+#[derive(Clone)]
+struct DiffAuditHunk {
+    id: usize,
+    buffer_id: language::BufferId,
+    index_in_buffer: usize,
+}
+
+#[derive(Default, Deserialize)]
+struct DiffAuditResult {
+    #[serde(default)]
+    features: Vec<DiffAuditFeature>,
+}
+
+#[derive(Clone, Deserialize)]
+struct DiffAuditFeature {
+    title: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    hunk_ids: Vec<usize>,
+    #[serde(default)]
+    findings: Vec<DiffAuditFinding>,
+}
+
+#[derive(Clone, Deserialize)]
+struct DiffAuditFinding {
+    #[serde(default)]
+    severity: DiffAuditSeverity,
+    #[serde(default)]
+    hunk_id: Option<usize>,
+    #[serde(default)]
+    note: String,
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum DiffAuditSeverity {
+    #[default]
+    Info,
+    Warning,
+    Error,
+}
+
+const DIFF_AUDIT_PROMPT: &str = "\
+You are a code reviewer examining a set of changes made by an agent. The changes are \
+provided as numbered hunks: each hunk starts with a [HUNK-N] header line followed by the \
+lines of the new code in that hunk (each prefixed with +).
+
+Group the hunks into the logical features the change implements. For each feature, list \
+anything that might be wrong: bugs, edge cases, missing tests, breaking API changes, \
+security issues, or accidental changes.
+
+Respond with ONLY valid JSON in exactly this shape, with no markdown fences or \
+surrounding text:
+{
+  \"features\": [
+    {
+      \"title\": \"Short feature name\",
+      \"description\": \"One or two sentences describing what this feature does\",
+      \"hunk_ids\": [1, 2],
+      \"findings\": [
+        { \"severity\": \"info|warning|error\", \"hunk_id\": 1, \"note\": \"What might be wrong\" }
+      ]
+    }
+  ]
+}
+
+Rules:
+- Only reference hunk ids that exist in the diff.
+- If a feature has no issues, omit its findings array.
+- Do not invent features for trivial refactors; keep the list short.
+- Keep the entire response under 2000 tokens.";
+
+fn non_empty_hunk_text(snapshot: &language::BufferSnapshot, hunk: &DiffHunk) -> Option<String> {
+    let start = hunk.buffer_range.start.to_offset(snapshot);
+    let end = hunk.buffer_range.end.to_offset(snapshot);
+    let text = snapshot.text().get(start..end)?.to_string();
+    (!text.trim().is_empty()).then_some(text)
+}
+
+fn parse_audit_response(output: &str) -> Option<DiffAuditResult> {
+    let trimmed = output.trim();
+    let output = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .unwrap_or(trimmed);
+    let start = output.find('{')?;
+    let end = output.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    serde_json::from_str(&output[start..=end]).ok()
 }
 
 struct AgentDiffDelegate {
@@ -1268,6 +1884,15 @@ impl Render for AgentDiffToolbar {
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.dispatch_action(&KeepAll, window, cx)
                                     })),
+                            )
+                            .child(
+                                Button::new("audit-diff", "Audit")
+                                    .start_icon(Icon::new(IconName::ListTodo).size(IconSize::Small))
+                                    .on_click(move |_event, window, cx| {
+                                        agent_diff.update(cx, |diff, cx| {
+                                            diff.start_audit(&AuditDiff, window, cx);
+                                        });
+                                    }),
                             ),
                     )
                     .into_any()
