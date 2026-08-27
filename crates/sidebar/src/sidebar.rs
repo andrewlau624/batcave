@@ -616,7 +616,8 @@ impl WorkspaceMenuWorktreeLabel {
             .when_some(self.branch_name, |this, branch_name| {
                 this.child(
                     Label::new(SharedString::from(format!("@{branch_name}")))
-                        .color(Color::Muted),
+                        .color(Color::Muted)
+                        .truncate(),
                 )
             })
     }
@@ -2733,7 +2734,15 @@ impl Sidebar {
                                     .folder_paths()
                                     .paths()
                                     .iter()
-                                    .any(|path| path == &row_root);
+                                    .any(|path| {
+                                        path == &row_root || path.starts_with(&row_root)
+                                    })
+                                    || thread
+                                        .metadata
+                                        .main_worktree_paths()
+                                        .paths()
+                                        .iter()
+                                        .any(|path| path == &row_root);
                                 matches_row.then(|| thread.clone())
                             })
                             .collect::<Vec<_>>();
@@ -2806,7 +2815,13 @@ impl Sidebar {
                                 }),
                             )
                             .when_some(row.label.clone(), |this, label| {
-                                this.child(h_flex().min_w_0().gap_1().child(label.render()))
+                                this.child(
+                                    h_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .gap_1()
+                                        .child(label.render()),
+                                )
                             })
                             .when(row.is_busy, |this| {
                                 this.child(
@@ -3273,14 +3288,28 @@ impl Sidebar {
                 window,
                 cx,
                 move |mut menu, _window, cx| {
+                    let base_workspace = active_workspace
+                        .as_ref()
+                        .filter(|workspace| open_workspaces.contains(workspace))
+                        .cloned()
+                        .or_else(|| open_workspaces.first().cloned());
+
+                    let new_worktree_repo = base_workspace
+                        .as_ref()
+                        .and_then(|workspace| {
+                            workspace.read(cx).project().read(cx).active_repository(cx)
+                        })
+                        .clone();
+
                     menu = menu.entry(
                         "New Worktree…",
                         Some(Box::new(zed_actions::git::Worktree)),
                         {
                             let this = this.clone();
+                            let new_worktree_repo = new_worktree_repo.clone();
                             move |window, cx| {
                                 this.update(cx, |sidebar, cx| {
-                                    sidebar.open_worktree_picker(None, window, cx);
+                                    sidebar.open_worktree_picker(new_worktree_repo.clone(), window, cx);
                                 })
                                 .ok();
                             }
@@ -3335,12 +3364,6 @@ impl Sidebar {
                             },
                         );
                     }
-
-                    let base_workspace = active_workspace
-                        .as_ref()
-                        .filter(|workspace| open_workspaces.contains(workspace))
-                        .cloned()
-                        .or_else(|| open_workspaces.first().cloned());
 
                     // Only offer worktree creation when the base project can
                     // actually create one; otherwise the submenu would expand to
