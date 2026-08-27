@@ -403,6 +403,8 @@ impl ThreadEntry {
 /// Index offset for thread rows rendered inside worktree sections, so their
 /// hover/selection indices never collide with list-mode entry indices.
 const WORKTREE_THREAD_OFFSET: usize = 100_000;
+/// Index offset for terminal rows rendered inside worktree sections.
+const WORKTREE_TERMINAL_OFFSET: usize = 200_000;
 
 #[derive(Clone)]
 enum ListEntry {
@@ -855,6 +857,7 @@ pub struct Sidebar {
     multi_workspace: WeakEntity<MultiWorkspace>,
     entry_mode: SidebarEntryMode,
     collapsed_worktrees: HashSet<PathBuf>,
+    collapsed_worktree_rows: HashSet<PathBuf>,
     width: Pixels,
     focus_handle: FocusHandle,
     filter_editor: Entity<Editor>,
@@ -1012,6 +1015,7 @@ impl Sidebar {
             multi_workspace: multi_workspace.downgrade(),
             entry_mode: SidebarEntryMode::default(),
             collapsed_worktrees: HashSet::new(),
+            collapsed_worktree_rows: HashSet::new(),
             width: DEFAULT_WIDTH,
             focus_handle,
             filter_editor,
@@ -2721,6 +2725,8 @@ impl Sidebar {
                                     .map(|path| path.to_path_buf())
                             })
                             .unwrap_or_else(|| main_path.clone());
+                        let row_collapsed = self.collapsed_worktree_rows.contains(&row_root);
+                        let sidebar_handle = cx.entity().downgrade();
                         let row_threads: Vec<Arc<ThreadEntry>> = self
                             .contents
                             .entries
@@ -2746,6 +2752,31 @@ impl Sidebar {
                                 matches_row.then(|| thread.clone())
                             })
                             .collect::<Vec<_>>();
+                        let row_terminals: Vec<TerminalEntry> = self
+                            .contents
+                            .entries
+                            .iter()
+                            .filter_map(|entry| {
+                                let ListEntry::Terminal(terminal) = entry else {
+                                    return None;
+                                };
+                                let matches_row = terminal
+                                    .metadata
+                                    .folder_paths()
+                                    .paths()
+                                    .iter()
+                                    .any(|path| {
+                                        path == &row_root || path.starts_with(&row_root)
+                                    })
+                                    || terminal
+                                        .metadata
+                                        .main_worktree_paths()
+                                        .paths()
+                                        .iter()
+                                        .any(|path| path == &row_root);
+                                matches_row.then(|| terminal.clone())
+                            })
+                            .collect::<Vec<_>>();
                         v_flex()
                             .w_full()
                             .child(
@@ -2760,6 +2791,32 @@ impl Sidebar {
                             .gap_1p5()
                             .rounded_sm()
                             .border_l_2()
+                            .child(
+                                IconButton::new(
+                                    SharedString::from(format!("worktree-row-disclosure-{ix}")),
+                                    if row_collapsed {
+                                        IconName::ChevronRight
+                                    } else {
+                                        IconName::ChevronDown
+                                    },
+                                )
+                                .icon_size(IconSize::Small)
+                                .icon_color(Color::Muted)
+                                .tooltip(Tooltip::text(if row_collapsed {
+                                    "Expand"
+                                } else {
+                                    "Collapse"
+                                }))
+                                .on_click(cx.listener(move |this, _, _window, cx| {
+                                    if row_collapsed {
+                                        this.collapsed_worktree_rows.remove(&row_root);
+                                    } else {
+                                        this.collapsed_worktree_rows
+                                            .insert(row_root.clone());
+                                    }
+                                    cx.notify();
+                                })),
+                            )
                             .when(row.is_active, |this| {
                                 this.bg(color.element_background)
                                     .border_color(color.border_focused)
@@ -2833,18 +2890,76 @@ impl Sidebar {
                             })
                             .when_some(row.workspace.clone(), |this, workspace| {
                                 this.child(
-                                    IconButton::new(
-                                        SharedString::from(format!(
-                                            "worktree-row-new-thread-{ix}"
-                                        )),
-                                        IconName::Plus,
+                                    PopoverMenu::new(SharedString::from(format!(
+                                        "worktree-row-new-{ix}"
+                                    )))
+                                    .trigger(
+                                        IconButton::new(
+                                            SharedString::from(format!(
+                                                "worktree-row-new-trigger-{ix}"
+                                            )),
+                                            IconName::Plus,
+                                        )
+                                        .icon_size(IconSize::Small)
+                                        .icon_color(Color::Muted),
                                     )
-                                    .icon_size(IconSize::Small)
-                                    .icon_color(Color::Muted)
-                                    .tooltip(Tooltip::text("New Agent Thread"))
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.create_new_entry(&workspace, window, cx);
-                                    })),
+                                    .menu({
+                                        let sidebar_handle = sidebar_handle.clone();
+                                        move |window, cx| {
+                                            let workspace = workspace.clone();
+                                            let sidebar_handle = sidebar_handle.clone();
+                                            Some(ContextMenu::build(
+                                                window,
+                                                cx,
+                                                move |mut menu, _window, _cx| {
+                                                    menu = menu.header("New In Worktree");
+                                                    menu = menu.entry(
+                                                        "New Agent Thread",
+                                                        None,
+                                                        {
+                                                            let sidebar_handle =
+                                                                sidebar_handle.clone();
+                                                            let workspace = workspace.clone();
+                                                            move |window, cx| {
+                                                                if let Some(sidebar) =
+                                                                    sidebar_handle.upgrade()
+                                                                {
+                                                                    sidebar.update(cx, |sidebar, cx| {
+                                                                        sidebar.create_new_thread(
+                                                                            &workspace, window, cx,
+                                                                        );
+                                                                    });
+                                                                }
+                                                            }
+                                                        },
+                                                    );
+                                                    menu = menu.entry(
+                                                        "New Terminal",
+                                                        None,
+                                                        {
+                                                            let sidebar_handle =
+                                                                sidebar_handle.clone();
+                                                            move |window, cx| {
+                                                                if let Some(sidebar) =
+                                                                    sidebar_handle.upgrade()
+                                                                {
+                                                                    sidebar.update(cx, |sidebar, cx| {
+                                                                        sidebar
+                                                                            .create_new_terminal(
+                                                                                &workspace,
+                                                                                window,
+                                                                                cx,
+                                                                            );
+                                                                    });
+                                                                }
+                                                            }
+                                                        },
+                                                    );
+                                                    menu
+                                                },
+                                            ))
+                                        }
+                                    }),
                                 )
                             })
                             .when_some(row.workspace, |this, workspace| {
@@ -2938,7 +3053,7 @@ impl Sidebar {
                                     }),
                                 )
                             })
-                            .when(!is_section_collapsed, |el| {
+                            .when(!is_section_collapsed && !row_collapsed, |el| {
                                 el.child(
                                     v_flex()
                                         .w_full()
@@ -2959,6 +3074,28 @@ impl Sidebar {
                                                     self.render_thread(
                                                         WORKTREE_THREAD_OFFSET + thread_ix,
                                                         &thread,
+                                                        is_active,
+                                                        false,
+                                                        cx,
+                                                    )
+                                                }),
+                                        )
+                                        .children(
+                                            row_terminals
+                                                .into_iter()
+                                                .enumerate()
+                                                .map(|(terminal_ix, terminal)| {
+                                                    let is_active = self
+                                                        .active_entry
+                                                        .as_ref()
+                                                        .is_some_and(|active| {
+                                                            active.matches_entry(&ListEntry::Terminal(
+                                                                terminal.clone(),
+                                                            ))
+                                                        });
+                                                    self.render_terminal(
+                                                        WORKTREE_TERMINAL_OFFSET + terminal_ix,
+                                                        &terminal,
                                                         is_active,
                                                         false,
                                                         cx,
@@ -6893,6 +7030,9 @@ impl Sidebar {
         };
 
         let is_remote = thread.workspace.is_remote(cx);
+        // Hover-only action buttons (rename, stop) overflow narrow sidebars;
+        // hide them until there's room.
+        let show_hover_actions = self.width >= px(200.);
 
         let worktrees = apply_worktree_label_mode(
             thread.worktrees.clone(),
@@ -6965,7 +7105,7 @@ impl Sidebar {
                         .child(title_editor),
                 )
             })
-            .when(is_hovered && !is_renaming, |this| {
+            .when(is_hovered && !is_renaming && show_hover_actions, |this| {
                 let rename_button = IconButton::new(("rename-thread", ix), IconName::Pencil)
                     .icon_size(IconSize::Small)
                     .tooltip({
@@ -7235,6 +7375,7 @@ impl Sidebar {
             cx.flag_value::<AgentThreadWorktreeLabelFlag>(),
         );
         let is_remote = terminal.workspace.is_remote(cx);
+        let show_hover_actions = self.width >= px(200.);
 
         let display_title = terminal.metadata.display_title();
         let (icon_char, title, highlight_positions) =
@@ -7263,7 +7404,7 @@ impl Sidebar {
                 }
                 cx.notify();
             }))
-            .when(is_hovered, |this| {
+            .when(is_hovered && show_hover_actions, |this| {
                 this.action_slot(
                     IconButton::new("close-terminal", IconName::Close)
                         .icon_size(IconSize::Small)
