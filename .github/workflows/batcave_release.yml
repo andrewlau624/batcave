@@ -1,0 +1,115 @@
+# Release workflow for this fork.
+#
+# Upstream's `release.yml` gates every build job behind
+# `github.repository_owner == 'zed-industries'` and targets `namespace-profile-*`
+# runners this fork has no access to, so it can never publish here. This workflow
+# is separate rather than a patch to that file, so upstream merges stay clean.
+#
+# Publishing flow:
+#   1. bump `version` in crates/zed/Cargo.toml
+#   2. commit, then tag `v<that exact version>` and push the tag
+#   3. this workflow builds a macOS arm64 DMG and attaches it to a GitHub Release
+#
+# The installed app's auto-updater (crates/auto_update) reads that release via
+# the GitHub API and matches the asset by its `zed-{os}-{arch}` name prefix.
+name: batcave_release
+
+on:
+  push:
+    tags:
+      - v*
+
+# Needed to create the release and upload assets.
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: '1'
+
+jobs:
+  bundle_mac:
+    # Mirrors upstream's owner guard so this stays inert if the repo is re-forked.
+    if: github.repository_owner == 'andrewlau624'
+    runs-on: macos-14
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@v4
+        with:
+          # bundle-mac embeds the commit sha, and auto_update compares it on
+          # nightly channels, so the full history is needed rather than a
+          # shallow clone.
+          fetch-depth: 0
+
+      - name: Verify the tag matches crates/zed/Cargo.toml
+        # The version baked into the binary is what auto_update compares a
+        # fetched release against. If the tag and the manifest disagree, the
+        # published release either never gets offered or gets offered forever,
+        # so fail loudly here instead of shipping a broken update.
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          manifest_version="$(sed -n 's/^version = "\(.*\)"/\1/p' crates/zed/Cargo.toml | head -n 1)"
+          echo "tag=${tag_version} manifest=${manifest_version}"
+          if [[ "${tag_version}" != "${manifest_version}" ]]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match crates/zed/Cargo.toml version ${manifest_version}."
+            echo "::error::Bump the manifest and re-tag so the built binary reports the version it is published under."
+            exit 1
+          fi
+
+      - name: Install the Rust toolchain
+        # rust-toolchain.toml pins the version; this just adds the mac target.
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add aarch64-apple-darwin
+
+      - name: Cache cargo registry and target dir
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: batcave-release-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: batcave-release-${{ runner.os }}-
+
+      - name: Select the stable release channel
+        # crates/zed/RELEASE_CHANNEL is `dev` in-tree, and
+        # ReleaseChannel::poll_for_updates() returns false for Dev, which makes
+        # "Check for Update" a silent no-op. Published builds ship as `stable`
+        # so they actually poll. Written at build time only; never committed.
+        run: echo -n "stable" > crates/zed/RELEASE_CHANNEL
+
+      - name: Build the macOS bundle
+        # Without Apple signing secrets, bundle-mac ad-hoc signs and skips
+        # notarization. See the release notes below for the Gatekeeper caveat.
+        run: script/bundle-mac aarch64-apple-darwin
+
+      - name: Rename the DMG to the asset name auto_update expects
+        # auto_update matches assets by a `{asset}-{os}-{arch}` prefix, where
+        # `asset` is "zed" and os/arch come from Rust's std::env::consts.
+        run: |
+          set -euo pipefail
+          built_dmg="target/aarch64-apple-darwin/release/Zed-aarch64.dmg"
+          test -f "${built_dmg}" || { echo "::error::expected DMG at ${built_dmg}"; exit 1; }
+          mv "${built_dmg}" "target/aarch64-apple-darwin/release/zed-macos-aarch64.dmg"
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file - \
+            "target/aarch64-apple-darwin/release/zed-macos-aarch64.dmg" <<'NOTES'
+          Download `zed-macos-aarch64.dmg` below, or use **Batcave → Check for Update** in an already-installed build.
+
+          This build is ad-hoc signed rather than signed with an Apple Developer ID. macOS attaches a quarantine flag to browser downloads, so the first launch after downloading here may report the app as damaged. Clear it with:
+
+          ```
+          xattr -dr com.apple.quarantine /Applications/Batcave.app
+          ```
+
+          Updates applied in-app do not go through the browser and are not quarantined.
+          NOTES
