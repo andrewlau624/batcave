@@ -3298,15 +3298,13 @@ impl Sidebar {
                         .as_ref()
                         .and_then(|workspace| {
                             workspace.read(cx).project().read(cx).active_repository(cx)
-                        })
-                        .clone();
+                        });
 
                     menu = menu.entry(
                         "New Worktree…",
                         Some(Box::new(zed_actions::git::Worktree)),
                         {
                             let this = this.clone();
-                            let new_worktree_repo = new_worktree_repo.clone();
                             move |window, cx| {
                                 this.update(cx, |sidebar, cx| {
                                     sidebar.open_worktree_picker(new_worktree_repo.clone(), window, cx);
