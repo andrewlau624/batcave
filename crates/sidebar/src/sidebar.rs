@@ -29,9 +29,9 @@ use feature_flags::{
 };
 use gpui::{
     Action as _, AnyElement, App, ClickEvent, Context, Decorations, DismissEvent, Entity, EntityId,
-    FocusHandle, Focusable, KeyContext, ListState, Modifiers, Pixels, Render, SharedString, Task,
-    TaskExt, WeakEntity, Window, WindowBackgroundAppearance, WindowHandle, linear_color_stop,
-    linear_gradient, list, prelude::*, px,
+    FocusHandle, Focusable, KeyContext, ListState, Modifiers, Pixels, Render, ScrollHandle,
+    SharedString, Task, TaskExt, WeakEntity, Window, WindowBackgroundAppearance, WindowHandle,
+    linear_color_stop, linear_gradient, list, prelude::*, px,
 };
 use itertools::Itertools;
 use language_model::LanguageModelRegistry;
@@ -54,10 +54,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 use theme::{ActiveTheme, CLIENT_SIDE_DECORATION_ROUNDING};
 use ui::{
-    AgentThreadStatus, CommonAnimationExt, ContextMenu, ContextMenuEntry, Divider, GradientFade,
-    HighlightedLabel, KeyBinding, PopoverMenu, PopoverMenuHandle, ProjectEmptyState, ScrollAxes,
-    Scrollbars, Tab, ThreadItem, ThreadItemWorktreeInfo, TintColor, Tooltip, WithScrollbar,
-    prelude::*, render_modifiers, right_click_menu,
+    AgentThreadStatus, CommonAnimationExt, ContextMenu, ContextMenuEntry, Disclosure, Divider,
+    GradientFade, HighlightedLabel, KeyBinding, PopoverMenu, PopoverMenuHandle, ProjectEmptyState,
+    ScrollAxes, Scrollbars, Tab, ThreadItem, ThreadItemWorktreeInfo, TintColor, Tooltip,
+    WithScrollbar, prelude::*, render_modifiers, right_click_menu,
 };
 use unicode_segmentation::UnicodeSegmentation as _;
 use util::ResultExt as _;
@@ -71,9 +71,7 @@ use workspace::{
 
 use git_ui_core::worktree_service::{RemoteBranchName, worktree_create_targets};
 use zed_actions::editor::{MoveDown, MoveUp};
-use zed_actions::{
-    CreateWorktree, NewWorktreeBranchTarget, OpenRecent, SwitchWorktree,
-};
+use zed_actions::{CreateWorktree, NewWorktreeBranchTarget, OpenRecent, SwitchWorktree};
 
 use zed_actions::agents_sidebar::{FocusSidebarFilter, ToggleThreadSwitcher};
 
@@ -400,11 +398,70 @@ impl ThreadEntry {
     }
 }
 
-/// Index offset for thread rows rendered inside worktree sections, so their
-/// hover/selection indices never collide with list-mode entry indices.
-const WORKTREE_THREAD_OFFSET: usize = 100_000;
-/// Index offset for terminal rows rendered inside worktree sections.
-const WORKTREE_TERMINAL_OFFSET: usize = 200_000;
+/// Index offset for thread and terminal rows rendered inside worktree
+/// sections, so their hover/selection indices never collide with list-mode
+/// entry indices.
+const WORKTREE_ENTRY_OFFSET: usize = 100_000;
+
+/// How much detail a thread or terminal row shows. Rows nested under a worktree
+/// in the worktree tree drop the second metadata line — the parent row already
+/// names the worktree — so they stay one line tall.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EntryDensity {
+    Comfortable,
+    Compact,
+}
+
+/// The entry whose title the inline rename editor is currently editing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RenameTarget {
+    Thread(ThreadId),
+    Terminal(TerminalId),
+}
+
+/// A single worktree of a repository, together with the threads and terminals
+/// that are open in it.
+struct WorktreeRow {
+    /// Root of this worktree's workspace, or the main checkout when the
+    /// workspace is not open. Identifies the row for element ids, hover groups
+    /// and collapse state.
+    root: PathBuf,
+    workspace: Option<Entity<Workspace>>,
+    label: Option<WorkspaceMenuWorktreeLabel>,
+    is_active: bool,
+    is_busy: bool,
+    is_main: bool,
+    threads: Vec<Arc<ThreadEntry>>,
+    terminals: Vec<TerminalEntry>,
+    /// Hover index of this row's first child entry; threads occupy
+    /// `entry_index..entry_index + threads.len()` and terminals follow. Unique
+    /// across the whole list, so hovering one row's entry never highlights
+    /// another row's.
+    entry_index: usize,
+}
+
+/// One repository, with a row per open worktree of it.
+struct WorktreeSection {
+    label: SharedString,
+    main_path: PathBuf,
+    repository: Option<Entity<project::git_store::Repository>>,
+    rows: Vec<WorktreeRow>,
+}
+
+fn worktree_entry_matches(
+    folder_paths: &PathList,
+    main_worktree_paths: &PathList,
+    root: &Path,
+) -> bool {
+    folder_paths
+        .paths()
+        .iter()
+        .any(|path| path.as_path() == root || path.starts_with(root))
+        || main_worktree_paths
+            .paths()
+            .iter()
+            .any(|path| path.as_path() == root)
+}
 
 #[derive(Clone)]
 enum ListEntry {
@@ -753,11 +810,7 @@ fn spawn_delete_worktree(
                 .repositories(cx)
                 .values()
                 .find(|repo| {
-                    repo.read(cx)
-                        .snapshot()
-                        .work_directory_abs_path
-                        .as_ref()
-                        == root_path.as_ref()
+                    repo.read(cx).snapshot().work_directory_abs_path.as_ref() == root_path.as_ref()
                 })?
                 .clone();
             Some(repo.update(cx, |repo, _| {
@@ -784,9 +837,11 @@ fn spawn_delete_worktree(
     task.detach();
 }
 
-fn apply_worktree_label_mode(    mut worktrees: Vec<ThreadItemWorktreeInfo>,
+fn apply_worktree_label_mode(
+    mut worktrees: Vec<ThreadItemWorktreeInfo>,
     mode: AgentThreadWorktreeLabel,
-) -> Vec<ThreadItemWorktreeInfo> {    match mode {
+) -> Vec<ThreadItemWorktreeInfo> {
+    match mode {
         AgentThreadWorktreeLabel::Both => {}
         AgentThreadWorktreeLabel::Worktree => {
             for wt in &mut worktrees {
@@ -858,6 +913,7 @@ pub struct Sidebar {
     entry_mode: SidebarEntryMode,
     collapsed_worktrees: HashSet<PathBuf>,
     collapsed_worktree_rows: HashSet<PathBuf>,
+    worktree_scroll_handle: ScrollHandle,
     width: Pixels,
     focus_handle: FocusHandle,
     filter_editor: Entity<Editor>,
@@ -871,11 +927,11 @@ pub struct Sidebar {
     /// Tracks which sidebar entry is currently active (highlighted).
     active_entry: Option<ActiveEntry>,
     hovered_thread_index: Option<usize>,
-    renaming_thread_id: Option<ThreadId>,
+    renaming_entry: Option<RenameTarget>,
     /// Threads in the database-backed regeneration path need their own loading
     /// state because they do not have a live `agent::Thread` to report it.
     regenerating_titles: HashSet<ThreadId>,
-    /// start_renaming_thread must seed current title into the title editor
+    /// start_renaming_entry must seed current title into the title editor
     /// so this prevents that BufferEdited event from being interpreted as user input.
     suppress_next_rename_edit: bool,
 
@@ -1016,6 +1072,7 @@ impl Sidebar {
             entry_mode: SidebarEntryMode::default(),
             collapsed_worktrees: HashSet::new(),
             collapsed_worktree_rows: HashSet::new(),
+            worktree_scroll_handle: ScrollHandle::new(),
             width: DEFAULT_WIDTH,
             focus_handle,
             filter_editor,
@@ -1025,7 +1082,7 @@ impl Sidebar {
             selection: None,
             active_entry: None,
             hovered_thread_index: None,
-            renaming_thread_id: None,
+            renaming_entry: None,
             regenerating_titles: HashSet::new(),
             suppress_next_rename_edit: false,
 
@@ -2343,10 +2400,22 @@ impl Sidebar {
                     cx,
                 )
             }
-            ListEntry::Thread(thread) => self.render_thread(ix, thread, is_active, is_selected, cx),
-            ListEntry::Terminal(terminal) => {
-                self.render_terminal(ix, terminal, is_active, is_selected, cx)
-            }
+            ListEntry::Thread(thread) => self.render_thread(
+                ix,
+                thread,
+                is_active,
+                is_selected,
+                EntryDensity::Comfortable,
+                cx,
+            ),
+            ListEntry::Terminal(terminal) => self.render_terminal(
+                ix,
+                terminal,
+                is_active,
+                is_selected,
+                EntryDensity::Comfortable,
+                cx,
+            ),
         };
 
         if is_group_header_after_first {
@@ -2445,669 +2514,656 @@ impl Sidebar {
         busy_workspace_ids
     }
 
-    /// Flat browsable list of every open worktree, grouped by project.
-    /// Clicking a row only switches worktree; it never creates or opens an
-    /// agent thread.
+    /// Collects one section per repository, each with a row per open worktree,
+    /// and attaches the threads and terminals that belong to each row.
+    fn worktree_sections(
+        &self,
+        multi_workspace: &Entity<MultiWorkspace>,
+        cx: &App,
+    ) -> Vec<WorktreeSection> {
+        let busy_workspace_ids = self.busy_workspace_ids();
+        let active_workspace_id = multi_workspace.read(cx).workspace().entity_id();
+
+        let mut sections: Vec<WorktreeSection> = Vec::new();
+        for group in multi_workspace.read(cx).project_groups(cx) {
+            let Some(project) = group
+                .workspaces
+                .first()
+                .map(|workspace| workspace.read(cx).project().clone())
+            else {
+                continue;
+            };
+            let repositories: Vec<(Entity<project::git_store::Repository>, _)> = project
+                .read(cx)
+                .repositories(cx)
+                .values()
+                .map(|repository| {
+                    let snapshot = repository.read(cx).snapshot();
+                    (repository.clone(), snapshot)
+                })
+                .collect();
+            let workspace_repos: Vec<(Entity<Workspace>, PathBuf)> = group
+                .workspaces
+                .iter()
+                .filter_map(|workspace| {
+                    let root = workspace.read(cx).root_paths(cx).into_iter().next()?;
+                    // The workspace's root matches a repository's working
+                    // directory, its main checkout, or one of its linked
+                    // worktrees. The latter is what lets every open worktree
+                    // of a repo surface as a row, since all workspaces of a
+                    // repo share one project group keyed on the main path.
+                    let (_, snapshot) = repositories.iter().find(|(_, snapshot)| {
+                        snapshot.work_directory_abs_path.as_ref() == root.as_ref()
+                            || snapshot.main_worktree_abs_path() == Some(root.as_ref())
+                            || snapshot
+                                .linked_worktrees()
+                                .iter()
+                                .any(|worktree| worktree.path.as_path() == root.as_ref())
+                    })?;
+                    Some((
+                        workspace.clone(),
+                        snapshot.main_worktree_abs_path()?.to_path_buf(),
+                    ))
+                })
+                .collect();
+
+            let mut group_sections: Vec<WorktreeSection> = Vec::new();
+            for (repository, snapshot) in repositories {
+                let Some(main_path) = snapshot.main_worktree_abs_path().map(Path::to_path_buf)
+                else {
+                    continue;
+                };
+                let label = main_path
+                    .file_name()
+                    .map(|name| SharedString::from(name.to_string_lossy().to_string()))
+                    .unwrap_or_else(|| "Repository".into());
+                if let Some(section) = group_sections
+                    .iter_mut()
+                    .find(|section| section.main_path == main_path)
+                {
+                    section.repository.get_or_insert(repository);
+                } else {
+                    group_sections.push(WorktreeSection {
+                        label,
+                        main_path,
+                        repository: Some(repository),
+                        rows: Vec::new(),
+                    });
+                }
+            }
+
+            for (workspace, main_path) in workspace_repos {
+                let root = workspace.read(cx).root_paths(cx).into_iter().next();
+                let is_main = root.as_deref() == Some(main_path.as_path());
+                let label = root
+                    .as_ref()
+                    .and_then(|root| root.file_name())
+                    .map(|name| SharedString::from(name.to_string_lossy().to_string()))
+                    .unwrap_or_else(|| "Workspace".into());
+                let row = WorktreeRow {
+                    root: root
+                        .as_deref()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| main_path.clone()),
+                    workspace: Some(workspace.clone()),
+                    label: workspace_menu_worktree_labels(&workspace, cx)
+                        .into_iter()
+                        .next(),
+                    is_active: workspace.entity_id() == active_workspace_id,
+                    is_busy: busy_workspace_ids.contains(&workspace.entity_id()),
+                    is_main,
+                    threads: Vec::new(),
+                    terminals: Vec::new(),
+                    entry_index: 0,
+                };
+                match group_sections
+                    .iter_mut()
+                    .find(|section| section.main_path == main_path)
+                {
+                    Some(section) => {
+                        if is_main {
+                            section.rows.insert(0, row);
+                        } else {
+                            section.rows.push(row);
+                        }
+                    }
+                    None => group_sections.push(WorktreeSection {
+                        label,
+                        main_path,
+                        repository: None,
+                        rows: vec![row],
+                    }),
+                }
+            }
+
+            // Always show the main checkout, even when its workspace is
+            // not open, so it's clear what main is on and what is a
+            // worktree. Clicking the ghost row opens the main checkout.
+            for section in &mut group_sections {
+                if !section.rows.iter().any(|row| row.is_main) {
+                    section.rows.insert(
+                        0,
+                        WorktreeRow {
+                            root: section.main_path.clone(),
+                            workspace: None,
+                            label: Some(WorkspaceMenuWorktreeLabel {
+                                icon: Some(IconName::GitBranch),
+                                primary_name: section.label.clone(),
+                                secondary_name: None,
+                                branch_name: None,
+                            }),
+                            is_active: false,
+                            is_busy: false,
+                            is_main: true,
+                            threads: Vec::new(),
+                            terminals: Vec::new(),
+                            entry_index: 0,
+                        },
+                    );
+                }
+            }
+
+            group_sections.sort_by(|left, right| left.label.cmp(&right.label));
+            sections.extend(group_sections);
+        }
+
+        let mut next_entry_index = WORKTREE_ENTRY_OFFSET;
+        for section in &mut sections {
+            for row in &mut section.rows {
+                for entry in &self.contents.entries {
+                    match entry {
+                        ListEntry::Thread(thread) => {
+                            if worktree_entry_matches(
+                                thread.metadata.folder_paths(),
+                                thread.metadata.main_worktree_paths(),
+                                &row.root,
+                            ) {
+                                row.threads.push(thread.clone());
+                            }
+                        }
+                        ListEntry::Terminal(terminal) => {
+                            if worktree_entry_matches(
+                                terminal.metadata.folder_paths(),
+                                terminal.metadata.main_worktree_paths(),
+                                &row.root,
+                            ) {
+                                row.terminals.push(terminal.clone());
+                            }
+                        }
+                        ListEntry::ProjectHeader { .. } => {}
+                    }
+                }
+                row.entry_index = next_entry_index;
+                next_entry_index += row.threads.len() + row.terminals.len();
+            }
+        }
+
+        sections
+    }
+
+    /// Browsable tree of every open worktree, grouped by repository, with each
+    /// worktree's threads and terminals nested underneath it. Clicking a
+    /// worktree row only switches worktree; it never creates or opens an agent
+    /// thread.
     fn render_worktree_browse_list(
         &self,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let Some(multi_workspace) = self.multi_workspace.upgrade() else {
             return div().into_any_element();
         };
 
-        struct WorktreeRow {
-            workspace: Option<Entity<Workspace>>,
-            label: Option<WorkspaceMenuWorktreeLabel>,
-            is_active: bool,
-            is_busy: bool,
-            is_main: bool,
-        }
-        struct WorktreeSection {
-            label: SharedString,
-            main_path: PathBuf,
-            repository: Option<Entity<project::git_store::Repository>>,
-            rows: Vec<WorktreeRow>,
-        }
-
-        let busy_workspace_ids = self.busy_workspace_ids();
-        let active_workspace_id = multi_workspace.read(cx).workspace().entity_id();
+        let sections = self.worktree_sections(&multi_workspace, cx);
         let active_workspace = multi_workspace.read(cx).workspace().clone();
-        let sections: Vec<WorktreeSection> = {
-            let multi_workspace = multi_workspace.read(cx);
-            let mut sections: Vec<WorktreeSection> = Vec::new();
-            for group in multi_workspace.project_groups(cx) {
-                let Some(project) = group
-                    .workspaces
-                    .first()
-                    .map(|workspace| workspace.read(cx).project().clone())
-                else {
-                    continue;
-                };
-                let repositories: Vec<(Entity<project::git_store::Repository>, _)> = project
-                    .read(cx)
-                    .repositories(cx)
-                    .values()
-                    .map(|repository| {
-                        let snapshot = repository.read(cx).snapshot();
-                        (repository.clone(), snapshot)
-                    })
-                    .collect();
-                let workspace_repos: Vec<(Entity<Workspace>, PathBuf)> = group
-                    .workspaces
-                    .iter()
-                    .filter_map(|workspace| {
-                        let root = workspace.read(cx).root_paths(cx).into_iter().next()?;
-                        // The workspace's root matches a repository's working
-                        // directory, its main checkout, or one of its linked
-                        // worktrees. The latter is what lets every open worktree
-                        // of a repo surface as a row, since all workspaces of a
-                        // repo share one project group keyed on the main path.
-                        let (_, snapshot) = repositories.iter().find(|(_, snapshot)| {
-                            snapshot.work_directory_abs_path.as_ref() == root.as_ref()
-                                || snapshot.main_worktree_abs_path() == Some(root.as_ref())
-                                || snapshot
-                                    .linked_worktrees()
-                                    .iter()
-                                    .any(|worktree| worktree.path.as_path() == root.as_ref())
-                        })?;
-                        Some((
-                            workspace.clone(),
-                            snapshot.main_worktree_abs_path()?.to_path_buf(),
-                        ))
-                    })
-                    .collect();
 
-                let mut group_sections: Vec<WorktreeSection> = Vec::new();
-                for (repository, snapshot) in repositories {
-                    let Some(main_path) = snapshot.main_worktree_abs_path().map(Path::to_path_buf)
-                    else {
-                        continue;
-                    };
-                    let label = main_path
-                        .file_name()
-                        .map(|name| SharedString::from(name.to_string_lossy().to_string()))
-                        .unwrap_or_else(|| "Repository".into());
-                    if let Some(section) = group_sections
-                        .iter_mut()
-                        .find(|section| section.main_path == main_path)
-                    {
-                        section.repository.get_or_insert(repository);
-                    } else {
-                        group_sections.push(WorktreeSection {
-                            label,
-                            main_path,
-                            repository: Some(repository),
-                            rows: Vec::new(),
-                        });
-                    }
-                }
-
-                for (workspace, main_path) in workspace_repos {
-                    let root = workspace.read(cx).root_paths(cx).into_iter().next();
-                    let is_main = root.as_deref() == Some(main_path.as_path());
-                    let row = WorktreeRow {
-                        workspace: Some(workspace.clone()),
-                        label: workspace_menu_worktree_labels(&workspace, cx)
-                            .into_iter()
-                            .next(),
-                        is_active: workspace.entity_id() == active_workspace_id,
-                        is_busy: busy_workspace_ids.contains(&workspace.entity_id()),
-                        is_main,
-                    };
-                    let label = root
-                        .as_ref()
-                        .and_then(|root| root.file_name())
-                        .map(|name| SharedString::from(name.to_string_lossy().to_string()))
-                        .unwrap_or_else(|| "Workspace".into());
-                    match group_sections
-                        .iter_mut()
-                        .find(|section| section.main_path == main_path)
-                    {
-                        Some(section) => {
-                            if is_main {
-                                section.rows.insert(0, row);
-                            } else {
-                                section.rows.push(row);
-                            }
-                        }
-                        None => group_sections.push(WorktreeSection {
-                            label,
-                            main_path,
-                            repository: None,
-                            rows: vec![row],
-                        }),
-                    }
-                }
-
-                // Always show the main checkout, even when its workspace is
-                // not open, so it's clear what main is on and what is a
-                // worktree. Clicking the ghost row opens the main checkout.
-                for section in &mut group_sections {
-                    if !section.rows.iter().any(|row| row.is_main) {
-                        section.rows.insert(
-                            0,
-                            WorktreeRow {
-                                workspace: None,
-                                label: Some(WorkspaceMenuWorktreeLabel {
-                                    icon: Some(IconName::GitBranch),
-                                    primary_name: section.label.clone(),
-                                    secondary_name: None,
-                                    branch_name: None,
-                                }),
-                                is_active: false,
-                                is_busy: false,
-                                is_main: true,
-                            },
-                        );
-                    }
-                }
-
-                group_sections.sort_by(|left, right| left.label.cmp(&right.label));
-                sections.extend(group_sections);
-            }
-            sections
-        };
-
-        let color = cx.theme().colors().clone();
         v_flex()
             .flex_1()
             .overflow_hidden()
             .px_1()
             .child(
-                h_flex()
-                    .w_full()
-                    .justify_between()
-                    .py_1()
-                    .px_1()
+                h_flex().w_full().py_1().px_1().child(
+                    Label::new("Worktrees")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                ),
+            )
+            .child(
+                v_flex()
+                    .relative()
+                    .flex_1()
+                    .overflow_hidden()
                     .child(
-                        Label::new("Worktrees")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
+                        v_flex()
+                            .id("worktree-browse-list")
+                            .size_full()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.worktree_scroll_handle)
+                            .children(sections.into_iter().map(|section| {
+                                self.render_worktree_section(
+                                    section,
+                                    &multi_workspace,
+                                    &active_workspace,
+                                    cx,
+                                )
+                            })),
+                    )
+                    .custom_scrollbars(
+                        Scrollbars::new(ScrollAxes::Vertical)
+                            .tracked_scroll_handle(&self.worktree_scroll_handle),
+                        window,
+                        cx,
                     ),
             )
-            .children(sections.into_iter().map(|section| {
-                let main_path = section.main_path.clone();
-                let main_label = section.label.clone();
-                let repository = section.repository.clone();
-                let is_section_collapsed = self.collapsed_worktrees.contains(&main_path);
-                v_flex()
+            .into_any_element()
+    }
+
+    fn render_worktree_section(
+        &self,
+        section: WorktreeSection,
+        multi_workspace: &Entity<MultiWorkspace>,
+        active_workspace: &Entity<Workspace>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let WorktreeSection {
+            label,
+            main_path,
+            repository,
+            rows,
+        } = section;
+
+        let is_collapsed = self.collapsed_worktrees.contains(&main_path);
+        let key = SharedString::from(main_path.to_string_lossy().to_string());
+        let group_name = SharedString::from(format!("worktree-section-group-{key}"));
+
+        v_flex()
+            .w_full()
+            .gap_0p5()
+            .pb_1()
+            .child(
+                h_flex()
+                    .id(SharedString::from(format!("worktree-section-{key}")))
+                    .group(&group_name)
                     .w_full()
-                    .gap_0p5()
-                    .pb_1()
+                    .gap_1()
+                    .justify_between()
+                    .px_1p5()
+                    .pt_1()
+                    .cursor_pointer()
+                    .on_click(cx.listener({
+                        move |this, _, _window, cx| {
+                            if !this.collapsed_worktrees.remove(&main_path) {
+                                this.collapsed_worktrees.insert(main_path.clone());
+                            }
+                            cx.notify();
+                        }
+                    }))
                     .child(
                         h_flex()
-                            .w_full()
-                            .justify_between()
-                            .px_1p5()
-                            .pt_1()
+                            .min_w_0()
+                            .gap_0p5()
+                            .items_center()
                             .child(
-                                h_flex()
-                                    .gap_0p5()
-                                    .items_center()
-                                    .child(
-                                        IconButton::new(
-                                            SharedString::from(format!(
-                                                "worktree-disclosure-{}",
-                                                main_path.display()
-                                            )),
-                                            if is_section_collapsed {
-                                                IconName::ChevronRight
-                                            } else {
-                                                IconName::ChevronDown
-                                            },
-                                        )
-                                        .icon_size(IconSize::Small)
-                                        .icon_color(Color::Muted)
-                                        .tooltip(Tooltip::text(if is_section_collapsed {
-                                            "Show threads"
-                                        } else {
-                                            "Hide threads"
-                                        }))
-                                        .on_click({
-                                            let main_path = main_path.clone();
-                                            cx.listener(move |this, _, _window, cx| {
-                                                if is_section_collapsed {
-                                                    this.collapsed_worktrees.remove(&main_path);
-                                                } else {
-                                                    this.collapsed_worktrees
-                                                        .insert(main_path.clone());
-                                                }
-                                                cx.notify();
-                                            })
-                                        }),
-                                    )
-                                    .child(
-                                        Label::new(section.label.clone())
-                                            .size(LabelSize::Small)
-                                            .color(Color::Muted),
-                                    ),
+                                Icon::new(if is_collapsed {
+                                    IconName::ChevronRight
+                                } else {
+                                    IconName::ChevronDown
+                                })
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
                             )
-                            .when_some(repository, |this, repository| {
-                                this.child(
-                                    IconButton::new(
-                                        SharedString::from(format!(
-                                            "new-worktree-{}",
-                                            main_path.display()
-                                        )),
-                                        IconName::Plus,
-                                    )
-                                    .icon_size(IconSize::Small)
-                                    .icon_color(Color::Muted)
-                                    .tooltip(Tooltip::text(format!(
-                                        "New Worktree in {main_label}…"
-                                    )))
-                                    .on_click(cx.listener(move |this, _event, window, cx| {
-                                        this.open_worktree_picker(
-                                            Some(repository.clone()),
-                                            window,
-                                            cx,
-                                        );
-                                    })),
-                                )
-                            }),
-                    )
-                    .children(section.rows.into_iter().enumerate().map(|(ix, row)| {
-                        // Threads opened in this worktree: match on the
-                        // workspace's own root (falling back to the main
-                        // checkout for the ghost row), so each worktree's
-                        // threads sit directly underneath it.
-                        let row_root: PathBuf = row
-                            .workspace
-                            .as_ref()
-                            .and_then(|workspace| {
-                                workspace
-                                    .read(cx)
-                                    .root_paths(cx)
-                                    .into_iter()
-                                    .next()
-                                    .map(|path| path.to_path_buf())
-                            })
-                            .unwrap_or_else(|| main_path.clone());
-                        let row_collapsed = self.collapsed_worktree_rows.contains(&row_root);
-                        let sidebar_handle = cx.entity().downgrade();
-                        let row_threads: Vec<Arc<ThreadEntry>> = self
-                            .contents
-                            .entries
-                            .iter()
-                            .filter_map(|entry| {
-                                let ListEntry::Thread(thread) = entry else {
-                                    return None;
-                                };
-                                let matches_row = thread
-                                    .metadata
-                                    .folder_paths()
-                                    .paths()
-                                    .iter()
-                                    .any(|path| {
-                                        path == &row_root || path.starts_with(&row_root)
-                                    })
-                                    || thread
-                                        .metadata
-                                        .main_worktree_paths()
-                                        .paths()
-                                        .iter()
-                                        .any(|path| path == &row_root);
-                                matches_row.then(|| thread.clone())
-                            })
-                            .collect::<Vec<_>>();
-                        let row_terminals: Vec<TerminalEntry> = self
-                            .contents
-                            .entries
-                            .iter()
-                            .filter_map(|entry| {
-                                let ListEntry::Terminal(terminal) = entry else {
-                                    return None;
-                                };
-                                let matches_row = terminal
-                                    .metadata
-                                    .folder_paths()
-                                    .paths()
-                                    .iter()
-                                    .any(|path| {
-                                        path == &row_root || path.starts_with(&row_root)
-                                    })
-                                    || terminal
-                                        .metadata
-                                        .main_worktree_paths()
-                                        .paths()
-                                        .iter()
-                                        .any(|path| path == &row_root);
-                                matches_row.then(|| terminal.clone())
-                            })
-                            .collect::<Vec<_>>();
-                        v_flex()
-                            .w_full()
                             .child(
+                                Label::new(label.clone())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .truncate(),
+                            ),
+                    )
+                    .when_some(repository, |this, repository| {
+                        this.child(
+                            IconButton::new(
+                                SharedString::from(format!("new-worktree-{key}")),
+                                IconName::Plus,
+                            )
+                            .icon_size(IconSize::Small)
+                            .icon_color(Color::Muted)
+                            .visible_on_hover(&group_name)
+                            .tooltip(Tooltip::text(format!("New Worktree in {label}…")))
+                            .on_click(cx.listener(
+                                move |this, _event, window, cx| {
+                                    this.open_worktree_picker(Some(repository.clone()), window, cx);
+                                },
+                            )),
+                        )
+                    }),
+            )
+            .when(!is_collapsed, |this| {
+                this.children(rows.into_iter().map(|row| {
+                    self.render_worktree_row(row, &label, multi_workspace, active_workspace, cx)
+                }))
+            })
+            .into_any_element()
+    }
+
+    fn render_worktree_row(
+        &self,
+        row: WorktreeRow,
+        section_label: &SharedString,
+        multi_workspace: &Entity<MultiWorkspace>,
+        active_workspace: &Entity<Workspace>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let WorktreeRow {
+            root,
+            workspace,
+            label,
+            is_active,
+            is_busy,
+            is_main,
+            threads,
+            terminals,
+            entry_index,
+        } = row;
+
+        let color = cx.theme().colors().clone();
+        let key = SharedString::from(root.to_string_lossy().to_string());
+        let group_name = SharedString::from(format!("worktree-row-group-{key}"));
+        let is_collapsed = self.collapsed_worktree_rows.contains(&root);
+        let thread_count = threads.len();
+        let has_entries = thread_count > 0 || !terminals.is_empty();
+
+        v_flex()
+            .w_full()
+            .child(
+                h_flex()
+                    .id(SharedString::from(format!("worktree-row-{key}")))
+                    .group(&group_name)
+                    .w_full()
+                    .min_w_0()
+                    .cursor_pointer()
+                    .px_1p5()
+                    .py_1()
+                    .gap_1()
+                    .rounded_sm()
+                    .map(|this| {
+                        if is_active {
+                            this.bg(color.element_background)
+                        } else {
+                            this.hover(|style| style.bg(color.element_hover))
+                        }
+                    })
+                    .when(workspace.is_none(), |this| this.opacity(0.6))
+                    .on_click({
+                        let workspace = workspace.clone();
+                        let multi_workspace = multi_workspace.clone();
+                        let active_workspace = active_workspace.clone();
+                        let root = root.clone();
+                        let section_label = section_label.clone();
+                        cx.listener(move |_, _, window, cx| match workspace.clone() {
+                            Some(workspace) => {
+                                multi_workspace.update(cx, |multi_workspace, cx| {
+                                    multi_workspace.activate(workspace, None, window, cx);
+                                });
+                            }
+                            None => {
+                                active_workspace.update(cx, |active_workspace, cx| {
+                                    git_ui_core::worktree_service::handle_switch_worktree(
+                                        active_workspace,
+                                        &SwitchWorktree {
+                                            path: root.clone(),
+                                            display_name: section_label.to_string(),
+                                        },
+                                        window,
+                                        None,
+                                        cx,
+                                    );
+                                });
+                            }
+                        })
+                    })
+                    // Rows without threads or terminals keep the disclosure's
+                    // footprint so every label in the section lines up.
+                    .child(if has_entries {
+                        Disclosure::new(
+                            SharedString::from(format!("worktree-row-disclosure-{key}")),
+                            !is_collapsed,
+                        )
+                        .tooltip(Tooltip::text(if is_collapsed {
+                            "Expand"
+                        } else {
+                            "Collapse"
+                        }))
+                        .on_click(cx.listener({
+                            move |this, _, _window, cx| {
+                                if !this.collapsed_worktree_rows.remove(&root) {
+                                    this.collapsed_worktree_rows.insert(root.clone());
+                                }
+                                cx.notify();
+                            }
+                        }))
+                        .into_any_element()
+                    } else {
+                        div()
+                            .flex_none()
+                            .size(ButtonSize::Default.rems())
+                            .into_any_element()
+                    })
+                    .child(
+                        Icon::new(if is_main {
+                            IconName::GitBranch
+                        } else {
+                            IconName::GitWorktree
+                        })
+                        .size(IconSize::XSmall)
+                        .color(if is_active {
+                            Color::Accent
+                        } else {
+                            Color::Muted
+                        }),
+                    )
+                    .child(
                         h_flex()
-                            .id(SharedString::from(format!(
-                                "worktree-row-{}-{ix}",
-                                main_path.display()
-                            )))
-                            .cursor_pointer()
-                            .px_1p5()
-                            .py_1()
-                            .gap_1p5()
-                            .rounded_sm()
-                            .border_l_2()
-                            .child(
-                                IconButton::new(
-                                    SharedString::from(format!("worktree-row-disclosure-{ix}")),
-                                    if row_collapsed {
-                                        IconName::ChevronRight
-                                    } else {
-                                        IconName::ChevronDown
-                                    },
-                                )
-                                .icon_size(IconSize::Small)
-                                .icon_color(Color::Muted)
-                                .tooltip(Tooltip::text(if row_collapsed {
-                                    "Expand"
-                                } else {
-                                    "Collapse"
-                                }))
-                                .on_click(cx.listener(move |this, _, _window, cx| {
-                                    if row_collapsed {
-                                        this.collapsed_worktree_rows.remove(&row_root);
-                                    } else {
-                                        this.collapsed_worktree_rows
-                                            .insert(row_root.clone());
-                                    }
-                                    cx.notify();
-                                })),
-                            )
-                            .when(row.is_active, |this| {
-                                this.bg(color.element_background)
-                                    .border_color(color.border_focused)
-                            })
-                            .when(!row.is_active, |this| {
-                                this.border_color(gpui::transparent_black())
-                                    .hover(|style| style.bg(color.element_hover))
-                            })
-                            .when(row.workspace.is_none(), |this| this.opacity(0.6))
-                            .on_click({
-                                let row_workspace = row.workspace.clone();
-                                let multi_workspace = multi_workspace.clone();
-                                let active_workspace = active_workspace.clone();
-                                let main_path = main_path.clone();
-                                let main_label = main_label.clone();
-                                cx.listener(move |_, _, window, cx| {
-                                    if let Some(workspace) = row_workspace.clone() {
-                                        multi_workspace.update(cx, |multi_workspace, cx| {
-                                            multi_workspace.activate(
-                                                workspace.clone(),
-                                                None,
-                                                window,
-                                                cx,
-                                            );
-                                        });
-                                    } else {
-                                        active_workspace.update(cx, |workspace, cx| {
-                                            git_ui_core::worktree_service::handle_switch_worktree(
-                                                workspace,
-                                                &SwitchWorktree {
-                                                    path: main_path.clone(),
-                                                    display_name: main_label.to_string(),
-                                                },
-                                                window,
-                                                None,
-                                                cx,
-                                            );
-                                        });
-                                    }
-                                })
-                            })
-                            .child(
-                                Icon::new(if row.is_main {
-                                    IconName::GitBranch
-                                } else {
-                                    IconName::GitWorktree
-                                })
-                                .size(IconSize::XSmall)
-                                .color(if row.is_active {
-                                    Color::Accent
-                                } else {
-                                    Color::Muted
-                                }),
-                            )
-                            .when_some(row.label.clone(), |this, label| {
-                                this.child(
-                                    h_flex()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .gap_1()
-                                        .child(label.render()),
-                                )
-                            })
-                            .when(row.is_busy, |this| {
-                                this.child(
-                                    Icon::new(IconName::LoadCircle)
-                                        .size(IconSize::XSmall)
-                                        .color(Color::Accent)
-                                        .with_rotate_animation(2),
-                                )
-                            })
-                            .when_some(row.workspace.clone(), |this, workspace| {
-                                this.child(
-                                    PopoverMenu::new(SharedString::from(format!(
-                                        "worktree-row-new-{ix}"
-                                    )))
-                                    .trigger(
-                                        IconButton::new(
-                                            SharedString::from(format!(
-                                                "worktree-row-new-trigger-{ix}"
-                                            )),
-                                            IconName::Plus,
-                                        )
-                                        .icon_size(IconSize::Small)
-                                        .icon_color(Color::Muted),
-                                    )
-                                    .menu({
-                                        let sidebar_handle = sidebar_handle.clone();
-                                        move |window, cx| {
-                                            let workspace = workspace.clone();
-                                            let sidebar_handle = sidebar_handle.clone();
-                                            Some(ContextMenu::build(
-                                                window,
-                                                cx,
-                                                move |mut menu, _window, _cx| {
-                                                    menu = menu.header("New In Worktree");
-                                                    menu = menu.entry(
-                                                        "New Agent Thread",
-                                                        None,
-                                                        {
-                                                            let sidebar_handle =
-                                                                sidebar_handle.clone();
-                                                            let workspace = workspace.clone();
-                                                            move |window, cx| {
-                                                                if let Some(sidebar) =
-                                                                    sidebar_handle.upgrade()
-                                                                {
-                                                                    sidebar.update(cx, |sidebar, cx| {
-                                                                        sidebar.create_new_thread(
-                                                                            &workspace, window, cx,
-                                                                        );
-                                                                    });
-                                                                }
-                                                            }
-                                                        },
-                                                    );
-                                                    menu = menu.entry(
-                                                        "New Terminal",
-                                                        None,
-                                                        {
-                                                            let sidebar_handle =
-                                                                sidebar_handle.clone();
-                                                            move |window, cx| {
-                                                                if let Some(sidebar) =
-                                                                    sidebar_handle.upgrade()
-                                                                {
-                                                                    sidebar.update(cx, |sidebar, cx| {
-                                                                        sidebar
-                                                                            .create_new_terminal(
-                                                                                &workspace,
-                                                                                window,
-                                                                                cx,
-                                                                            );
-                                                                    });
-                                                                }
-                                                            }
-                                                        },
-                                                    );
-                                                    menu
-                                                },
-                                            ))
-                                        }
-                                    }),
-                                )
-                            })
-                            .when_some(row.workspace, |this, workspace| {
-                                this.child(
-                                    PopoverMenu::new(SharedString::from(format!(
-                                        "worktree-row-menu-{ix}"
-                                    )))
-                                    .trigger(
-                                        IconButton::new(
-                                            SharedString::from(format!(
-                                                "worktree-row-menu-trigger-{ix}"
-                                            )),
-                                            IconName::Ellipsis,
-                                        )
-                                        .icon_size(IconSize::Small)
-                                        .icon_color(Color::Muted),
-                                    )
-                                    .menu({
-                                        let multi_workspace = multi_workspace.clone();
-                                        move |window, cx| {
-                                            let multi_workspace = multi_workspace.clone();
-                                            let workspace = workspace.clone();
-                                            let is_linked = workspace.read_with(cx, |workspace, cx| {
-                                                let Some(root_path) =
-                                                    workspace.root_paths(cx).into_iter().next()
-                                                else {
-                                                    return false;
-                                                };
-                                                workspace
-                                                    .project()
-                                                    .read(cx)
-                                                    .repositories(cx)
-                                                    .values()
-                                                    .any(|repo| {
-                                                        let snapshot = repo.read(cx).snapshot();
-                                                        snapshot.work_directory_abs_path.as_ref()
-                                                            == root_path.as_ref()
-                                                            && snapshot.is_linked_worktree()
-                                                    })
-                                            });
-                                            Some(ContextMenu::build(window, cx, move |menu, _, _| {
-                                                let menu = menu.entry("Close", None, {
-                                                    let multi_workspace = multi_workspace.clone();
-                                                    let workspace = workspace.clone();
-                                                    move |window, cx| {
-                                                        multi_workspace
-                                                            .update(cx, |multi_workspace, cx| {
-                                                                multi_workspace.remove(
-                                                                    [workspace.clone()],
-                                                                    workspace::RemovalIntent::
-                                                                        KeepProject,
-                                                                    window,
-                                                                    cx,
-                                                                )
-                                                            })
-                                                            .detach_and_log_err(cx);
-                                                    }
-                                                });
-                                                menu.when(is_linked, |menu| {
-                                                    menu.entry("Delete Worktree…", None, {
-                                                        let multi_workspace =
-                                                            multi_workspace.clone();
-                                                        let workspace = workspace.clone();
-                                                        move |window, cx| {
-                                                            spawn_delete_worktree(
-                                                                multi_workspace.clone(),
-                                                                workspace.clone(),
-                                                                false,
-                                                                window,
-                                                                cx,
-                                                            );
-                                                        }
-                                                    })
-                                                    .entry("Force Delete Worktree…", None, {
-                                                        let multi_workspace =
-                                                            multi_workspace.clone();
-                                                        let workspace = workspace.clone();
-                                                        move |window, cx| {
-                                                            spawn_delete_worktree(
-                                                                multi_workspace.clone(),
-                                                                workspace.clone(),
-                                                                true,
-                                                                window,
-                                                                cx,
-                                                            );
-                                                        }
-                                                    })
-                                                })
-                                            }))
-                                        }
-                                    }),
-                                )
-                            })
-                            .when(!is_section_collapsed && !row_collapsed, |el| {
-                                el.child(
-                                    v_flex()
-                                        .w_full()
-                                        .pl_3()
-                                        .children(
-                                            row_threads
-                                                .into_iter()
-                                                .enumerate()
-                                                .map(|(thread_ix, thread)| {
-                                                    let is_active = self
-                                                        .active_entry
-                                                        .as_ref()
-                                                        .is_some_and(|active| {
-                                                            active.matches_entry(&ListEntry::Thread(
-                                                                thread.clone(),
-                                                            ))
-                                                        });
-                                                    self.render_thread(
-                                                        WORKTREE_THREAD_OFFSET + thread_ix,
-                                                        &thread,
-                                                        is_active,
-                                                        false,
-                                                        cx,
-                                                    )
-                                                }),
-                                        )
-                                        .children(
-                                            row_terminals
-                                                .into_iter()
-                                                .enumerate()
-                                                .map(|(terminal_ix, terminal)| {
-                                                    let is_active = self
-                                                        .active_entry
-                                                        .as_ref()
-                                                        .is_some_and(|active| {
-                                                            active.matches_entry(&ListEntry::Terminal(
-                                                                terminal.clone(),
-                                                            ))
-                                                        });
-                                                    self.render_terminal(
-                                                        WORKTREE_TERMINAL_OFFSET + terminal_ix,
-                                                        &terminal,
-                                                        is_active,
-                                                        false,
-                                                        cx,
-                                                    )
-                                                }),
-                                        ),
-                                )
-                            }),
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1()
+                            .children(label.map(|label| label.render())),
                     )
-                    .into_any_element()
-                    }))
-            }))
+                    .when(is_busy, |this| {
+                        this.child(
+                            Icon::new(IconName::LoadCircle)
+                                .size(IconSize::XSmall)
+                                .color(Color::Accent)
+                                .with_rotate_animation(2),
+                        )
+                    })
+                    .when_some(workspace.clone(), |this, workspace| {
+                        this.child(self.render_worktree_row_new_menu(
+                            &key,
+                            &group_name,
+                            workspace,
+                            cx,
+                        ))
+                    })
+                    .when_some(workspace, |this, workspace| {
+                        this.child(self.render_worktree_row_menu(
+                            &key,
+                            &group_name,
+                            workspace,
+                            multi_workspace,
+                            cx,
+                        ))
+                    }),
+            )
+            .when(has_entries && !is_collapsed, |this| {
+                this.child(
+                    v_flex()
+                        .w_full()
+                        .pl_3()
+                        .children(threads.into_iter().enumerate().map(|(offset, thread)| {
+                            let is_active = self.active_entry.as_ref().is_some_and(|active| {
+                                active.matches_entry(&ListEntry::Thread(thread.clone()))
+                            });
+                            self.render_thread(
+                                entry_index + offset,
+                                &thread,
+                                is_active,
+                                false,
+                                EntryDensity::Compact,
+                                cx,
+                            )
+                        }))
+                        .children(terminals.into_iter().enumerate().map(|(offset, terminal)| {
+                            let is_active = self.active_entry.as_ref().is_some_and(|active| {
+                                active.matches_entry(&ListEntry::Terminal(terminal.clone()))
+                            });
+                            self.render_terminal(
+                                entry_index + thread_count + offset,
+                                &terminal,
+                                is_active,
+                                false,
+                                EntryDensity::Compact,
+                                cx,
+                            )
+                        })),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_worktree_row_new_menu(
+        &self,
+        key: &SharedString,
+        group_name: &SharedString,
+        workspace: Entity<Workspace>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let sidebar = cx.weak_entity();
+
+        PopoverMenu::new(SharedString::from(format!("worktree-row-new-{key}")))
+            .trigger(
+                IconButton::new(
+                    SharedString::from(format!("worktree-row-new-trigger-{key}")),
+                    IconName::Plus,
+                )
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Muted)
+                .visible_on_hover(group_name),
+            )
+            .menu(move |window, cx| {
+                let sidebar = sidebar.clone();
+                let workspace = workspace.clone();
+                Some(ContextMenu::build(window, cx, move |menu, _window, _cx| {
+                    menu.header("New In Worktree")
+                        .entry("New Agent Thread", None, {
+                            let sidebar = sidebar.clone();
+                            let workspace = workspace.clone();
+                            move |window, cx| {
+                                sidebar
+                                    .update(cx, |sidebar, cx| {
+                                        sidebar.create_new_thread(&workspace, window, cx);
+                                    })
+                                    .ok();
+                            }
+                        })
+                        .entry("New Terminal", None, {
+                            move |window, cx| {
+                                sidebar
+                                    .update(cx, |sidebar, cx| {
+                                        sidebar.create_new_terminal(&workspace, window, cx);
+                                    })
+                                    .ok();
+                            }
+                        })
+                }))
+            })
+            .into_any_element()
+    }
+
+    fn render_worktree_row_menu(
+        &self,
+        key: &SharedString,
+        group_name: &SharedString,
+        workspace: Entity<Workspace>,
+        multi_workspace: &Entity<MultiWorkspace>,
+        _cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let multi_workspace = multi_workspace.clone();
+
+        PopoverMenu::new(SharedString::from(format!("worktree-row-menu-{key}")))
+            .trigger(
+                IconButton::new(
+                    SharedString::from(format!("worktree-row-menu-trigger-{key}")),
+                    IconName::Ellipsis,
+                )
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Muted)
+                .visible_on_hover(group_name),
+            )
+            .menu(move |window, cx| {
+                let multi_workspace = multi_workspace.clone();
+                let workspace = workspace.clone();
+                let is_linked = workspace.read_with(cx, |workspace, cx| {
+                    let Some(root_path) = workspace.root_paths(cx).into_iter().next() else {
+                        return false;
+                    };
+                    workspace
+                        .project()
+                        .read(cx)
+                        .repositories(cx)
+                        .values()
+                        .any(|repo| {
+                            let snapshot = repo.read(cx).snapshot();
+                            snapshot.work_directory_abs_path.as_ref() == root_path.as_ref()
+                                && snapshot.is_linked_worktree()
+                        })
+                });
+                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                    let menu = menu.entry("Close", None, {
+                        let multi_workspace = multi_workspace.clone();
+                        let workspace = workspace.clone();
+                        move |window, cx| {
+                            multi_workspace
+                                .update(cx, |multi_workspace, cx| {
+                                    multi_workspace.remove(
+                                        [workspace.clone()],
+                                        workspace::RemovalIntent::KeepProject,
+                                        window,
+                                        cx,
+                                    )
+                                })
+                                .detach_and_log_err(cx);
+                        }
+                    });
+                    menu.when(is_linked, |menu| {
+                        menu.entry("Delete Worktree…", None, {
+                            let multi_workspace = multi_workspace.clone();
+                            let workspace = workspace.clone();
+                            move |window, cx| {
+                                spawn_delete_worktree(
+                                    multi_workspace.clone(),
+                                    workspace.clone(),
+                                    false,
+                                    window,
+                                    cx,
+                                );
+                            }
+                        })
+                        .entry("Force Delete Worktree…", None, {
+                            let multi_workspace = multi_workspace.clone();
+                            let workspace = workspace.clone();
+                            move |window, cx| {
+                                spawn_delete_worktree(
+                                    multi_workspace.clone(),
+                                    workspace.clone(),
+                                    true,
+                                    window,
+                                    cx,
+                                );
+                            }
+                        })
+                    })
+                }))
+            })
             .into_any_element()
     }
 
@@ -3431,11 +3487,9 @@ impl Sidebar {
                         .cloned()
                         .or_else(|| open_workspaces.first().cloned());
 
-                    let new_worktree_repo = base_workspace
-                        .as_ref()
-                        .and_then(|workspace| {
-                            workspace.read(cx).project().read(cx).active_repository(cx)
-                        });
+                    let new_worktree_repo = base_workspace.as_ref().and_then(|workspace| {
+                        workspace.read(cx).project().read(cx).active_repository(cx)
+                    });
 
                     menu = menu.entry(
                         "New Worktree…",
@@ -3444,7 +3498,11 @@ impl Sidebar {
                             let this = this.clone();
                             move |window, cx| {
                                 this.update(cx, |sidebar, cx| {
-                                    sidebar.open_worktree_picker(new_worktree_repo.clone(), window, cx);
+                                    sidebar.open_worktree_picker(
+                                        new_worktree_repo.clone(),
+                                        window,
+                                        cx,
+                                    );
                                 })
                                 .ok();
                             }
@@ -4166,8 +4224,8 @@ impl Sidebar {
     }
 
     fn cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
-        if self.renaming_thread_id.is_some() {
-            self.finish_thread_rename(window, cx);
+        if self.renaming_entry.is_some() {
+            self.finish_rename(window, cx);
             return;
         }
 
@@ -4231,22 +4289,27 @@ impl Sidebar {
         !self.filter_editor.read(cx).text(cx).is_empty()
     }
 
-    fn start_renaming_thread(
+    /// `ix` is the row's render index. Rows nested in the worktree tree are
+    /// offset past the flat list's range, so selection and scroll-to-reveal —
+    /// which both address `contents.entries` — only apply to list-mode rows.
+    fn start_renaming_entry(
         &mut self,
         ix: usize,
-        thread_id: ThreadId,
+        target: RenameTarget,
         title: SharedString,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.renaming_thread_id.is_some() && self.renaming_thread_id != Some(thread_id) {
-            self.finish_thread_rename(window, cx);
+        if self.renaming_entry.is_some() && self.renaming_entry != Some(target) {
+            self.finish_rename(window, cx);
         }
 
-        self.selection = Some(ix);
-        self.renaming_thread_id = Some(thread_id);
+        if ix < self.contents.entries.len() {
+            self.selection = Some(ix);
+            self.list_state.scroll_to_reveal_item(ix);
+        }
+        self.renaming_entry = Some(target);
         self.suppress_next_rename_edit = true;
-        self.list_state.scroll_to_reveal_item(ix);
         self.thread_rename_editor.update(cx, |editor, cx| {
             editor.set_text(title, window, cx);
             editor.select_all(&editor::actions::SelectAll, window, cx);
@@ -4275,13 +4338,21 @@ impl Sidebar {
                 if new_title.is_empty() {
                     return;
                 }
-                let Some(thread_id) = self.renaming_thread_id else {
+                let Some(target) = self.renaming_entry else {
                     return;
                 };
-                self.apply_thread_rename(thread_id, SharedString::from(new_title), window, cx);
+                let new_title = SharedString::from(new_title);
+                match target {
+                    RenameTarget::Thread(thread_id) => {
+                        self.apply_thread_rename(thread_id, new_title, window, cx);
+                    }
+                    RenameTarget::Terminal(terminal_id) => {
+                        Self::apply_terminal_rename(terminal_id, new_title, cx);
+                    }
+                }
             }
             editor::EditorEvent::Blurred => {
-                self.finish_thread_rename(window, cx);
+                self.finish_rename(window, cx);
             }
             _ => {}
         }
@@ -4320,8 +4391,21 @@ impl Sidebar {
         }
     }
 
-    fn finish_thread_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.renaming_thread_id.take().is_none() {
+    /// Terminals have no live view that owns their title, so the rename is
+    /// written straight to the metadata store.
+    fn apply_terminal_rename(terminal_id: TerminalId, title: SharedString, cx: &mut App) {
+        let store = TerminalThreadMetadataStore::global(cx);
+        store.update(cx, |store, cx| {
+            let Some(mut metadata) = store.entry(terminal_id).cloned() else {
+                return;
+            };
+            metadata.custom_title = Some(title);
+            store.save(metadata, cx);
+        });
+    }
+
+    fn finish_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.renaming_entry.take().is_none() {
             return false;
         }
         self.focus_handle.focus(window, cx);
@@ -4403,7 +4487,7 @@ impl Sidebar {
     }
 
     fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
-        if self.finish_thread_rename(window, cx) {
+        if self.finish_rename(window, cx) {
             return;
         }
 
@@ -6564,12 +6648,25 @@ impl Sidebar {
         let Some(ix) = self.selection else {
             return;
         };
-        let Some(ListEntry::Thread(thread)) = self.contents.entries.get(ix) else {
-            return;
-        };
-        let thread_id = thread.metadata.thread_id;
-        let title = thread.metadata.display_title();
-        self.start_renaming_thread(ix, thread_id, title, window, cx);
+        match self.contents.entries.get(ix) {
+            Some(ListEntry::Thread(thread)) => {
+                let thread_id = thread.metadata.thread_id;
+                let title = thread.metadata.display_title();
+                self.start_renaming_entry(ix, RenameTarget::Thread(thread_id), title, window, cx);
+            }
+            Some(ListEntry::Terminal(terminal)) => {
+                let terminal_id = terminal.metadata.terminal_id;
+                let title = terminal.metadata.display_title();
+                self.start_renaming_entry(
+                    ix,
+                    RenameTarget::Terminal(terminal_id),
+                    title,
+                    window,
+                    cx,
+                );
+            }
+            _ => {}
+        }
     }
 
     fn record_thread_access(&mut self, id: &ThreadId) {
@@ -6993,8 +7090,10 @@ impl Sidebar {
         thread: &ThreadEntry,
         is_active: bool,
         is_focused: bool,
+        density: EntryDensity,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let is_comfortable = density == EntryDensity::Comfortable;
         let has_notification = self.contents.is_thread_notified(&thread.metadata.thread_id);
 
         let title: SharedString = thread.metadata.display_title();
@@ -7009,7 +7108,8 @@ impl Sidebar {
             thread.status,
             AgentThreadStatus::Running | AgentThreadStatus::WaitingForConfirmation
         );
-        let is_renaming = self.renaming_thread_id == Some(thread.metadata.thread_id);
+        let is_renaming =
+            self.renaming_entry == Some(RenameTarget::Thread(thread.metadata.thread_id));
 
         let thread_id_for_actions = thread.metadata.thread_id;
         let session_id_for_delete = thread.metadata.session_id.clone();
@@ -7061,17 +7161,20 @@ impl Sidebar {
             .when_some(icon_svg, |this, svg| {
                 this.custom_icon_from_external_svg(svg)
             })
-            .worktrees(worktrees)
-            .timestamp(timestamp)
+            .when(is_comfortable, |this| {
+                this.worktrees(worktrees).timestamp(timestamp)
+            })
             .highlight_positions(thread.highlight_positions.to_vec())
             .title_generating(title_generating)
             .notified(has_notification)
-            .when(thread.diff_stats.lines_added > 0, |this| {
-                this.added(thread.diff_stats.lines_added as usize)
-            })
-            .when(thread.diff_stats.lines_removed > 0, |this| {
-                this.removed(thread.diff_stats.lines_removed as usize)
-            })
+            .when(
+                is_comfortable && thread.diff_stats.lines_added > 0,
+                |this| this.added(thread.diff_stats.lines_added as usize),
+            )
+            .when(
+                is_comfortable && thread.diff_stats.lines_removed > 0,
+                |this| this.removed(thread.diff_stats.lines_removed as usize),
+            )
             .selected(is_selected)
             .focused(is_focused)
             .hovered(is_hovered)
@@ -7091,15 +7194,15 @@ impl Sidebar {
                         .flex_1()
                         .capture_action(cx.listener(
                             |this, _: &editor::actions::Newline, window, cx| {
-                                this.finish_thread_rename(window, cx);
+                                this.finish_rename(window, cx);
                             },
                         ))
                         .on_action(cx.listener(|this, _: &Confirm, window, cx| {
-                            this.finish_thread_rename(window, cx);
+                            this.finish_rename(window, cx);
                         }))
                         .on_action(
                             cx.listener(|this, _: &editor::actions::Cancel, window, cx| {
-                                this.finish_thread_rename(window, cx);
+                                this.finish_rename(window, cx);
                             }),
                         )
                         .child(title_editor),
@@ -7122,9 +7225,9 @@ impl Sidebar {
                     .on_click({
                         let title = title.clone();
                         cx.listener(move |this, _, window, cx| {
-                            this.start_renaming_thread(
+                            this.start_renaming_entry(
                                 ix,
-                                thread_id_for_actions,
+                                RenameTarget::Thread(thread_id_for_actions),
                                 title.clone(),
                                 window,
                                 cx,
@@ -7264,9 +7367,9 @@ impl Sidebar {
                             move |window, cx| {
                                 sidebar
                                     .update(cx, |sidebar, cx| {
-                                        sidebar.start_renaming_thread(
+                                        sidebar.start_renaming_entry(
                                             ix,
-                                            thread_id,
+                                            RenameTarget::Thread(thread_id),
                                             rename_title.clone(),
                                             window,
                                             cx,
@@ -7358,8 +7461,10 @@ impl Sidebar {
         terminal: &TerminalEntry,
         is_active: bool,
         is_focused: bool,
+        density: EntryDensity,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let is_comfortable = density == EntryDensity::Comfortable;
         let id = ElementId::from(format!("terminal-{}", terminal.metadata.terminal_id));
         let timestamp = format_history_entry_timestamp(terminal.metadata.created_at);
         let is_hovered = self.hovered_thread_index == Some(ix);
@@ -7377,11 +7482,19 @@ impl Sidebar {
         let is_remote = terminal.workspace.is_remote(cx);
         let show_hover_actions = self.width >= px(200.);
 
+        let terminal_id = terminal.metadata.terminal_id;
+        let is_renaming = self.renaming_entry == Some(RenameTarget::Terminal(terminal_id));
+        let title_editor = self.thread_rename_editor.clone();
+
         let display_title = terminal.metadata.display_title();
         let (icon_char, title, highlight_positions) =
             match split_leading_icon_char(&display_title, &terminal.highlight_positions) {
                 Some((icon_char, title, positions)) => (Some(icon_char), title, positions),
-                None => (None, display_title, terminal.highlight_positions.clone()),
+                None => (
+                    None,
+                    display_title.clone(),
+                    terminal.highlight_positions.clone(),
+                ),
             };
 
         ThreadItem::new(id, title)
@@ -7389,8 +7502,9 @@ impl Sidebar {
             .icon(IconName::Terminal)
             .when_some(icon_char, |this, icon_char| this.icon_char(icon_char))
             .is_remote(is_remote)
-            .worktrees(worktrees)
-            .timestamp(timestamp)
+            .when(is_comfortable, |this| {
+                this.worktrees(worktrees).timestamp(timestamp)
+            })
             .notified(terminal.has_notification)
             .highlight_positions(highlight_positions)
             .selected(is_active)
@@ -7404,25 +7518,76 @@ impl Sidebar {
                 }
                 cx.notify();
             }))
-            .when(is_hovered && show_hover_actions, |this| {
+            .when(is_renaming, |this| {
+                this.is_truncated(false).title_slot(
+                    div()
+                        .h_full()
+                        .min_w_0()
+                        .flex_1()
+                        .capture_action(cx.listener(
+                            |this, _: &editor::actions::Newline, window, cx| {
+                                this.finish_rename(window, cx);
+                            },
+                        ))
+                        .on_action(cx.listener(|this, _: &Confirm, window, cx| {
+                            this.finish_rename(window, cx);
+                        }))
+                        .on_action(
+                            cx.listener(|this, _: &editor::actions::Cancel, window, cx| {
+                                this.finish_rename(window, cx);
+                            }),
+                        )
+                        .child(title_editor),
+                )
+            })
+            .when(is_hovered && !is_renaming && show_hover_actions, |this| {
                 this.action_slot(
-                    IconButton::new("close-terminal", IconName::Close)
-                        .icon_size(IconSize::Small)
-                        .icon_color(Color::Muted)
-                        .tooltip({
-                            let focus_handle = focus_handle.clone();
-                            move |_window, cx| {
-                                Tooltip::for_action_in(
-                                    "Close Terminal",
-                                    &ArchiveSelectedThread,
-                                    &focus_handle,
-                                    cx,
-                                )
-                            }
-                        })
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.close_terminal(&metadata, &workspace, window, cx);
-                        })),
+                    h_flex()
+                        .gap_0p5()
+                        .child(
+                            IconButton::new(("rename-terminal", ix), IconName::Pencil)
+                                .icon_size(IconSize::Small)
+                                .icon_color(Color::Muted)
+                                .tooltip({
+                                    let focus_handle = focus_handle.clone();
+                                    move |_window, cx| {
+                                        Tooltip::for_action_in(
+                                            "Rename Terminal",
+                                            &RenameSelectedThread,
+                                            &focus_handle,
+                                            cx,
+                                        )
+                                    }
+                                })
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.start_renaming_entry(
+                                        ix,
+                                        RenameTarget::Terminal(terminal_id),
+                                        display_title.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        )
+                        .child(
+                            IconButton::new("close-terminal", IconName::Close)
+                                .icon_size(IconSize::Small)
+                                .icon_color(Color::Muted)
+                                .tooltip({
+                                    let focus_handle = focus_handle.clone();
+                                    move |_window, cx| {
+                                        Tooltip::for_action_in(
+                                            "Close Terminal",
+                                            &ArchiveSelectedThread,
+                                            &focus_handle,
+                                            cx,
+                                        )
+                                    }
+                                })
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.close_terminal(&metadata, &workspace, window, cx);
+                                })),
+                        ),
                 )
             })
             .on_click(cx.listener({
@@ -8179,14 +8344,10 @@ impl Sidebar {
                                 IconButton::new("sidebar-mode-threads", IconName::ZedAgent)
                                     .icon_size(IconSize::Small)
                                     .tooltip(Tooltip::text("Agent Threads"))
-                                    .when(
-                                        self.entry_mode == SidebarEntryMode::Threads,
-                                        |button| {
-                                            button.selected_style(ButtonStyle::Tinted(
-                                                TintColor::Accent,
-                                            ))
-                                        },
-                                    )
+                                    .when(self.entry_mode == SidebarEntryMode::Threads, |button| {
+                                        button
+                                            .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+                                    })
                                     .on_click(cx.listener(|this, _, _window, cx| {
                                         this.entry_mode = SidebarEntryMode::Threads;
                                         this.update_entries(cx);

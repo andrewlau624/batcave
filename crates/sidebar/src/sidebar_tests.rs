@@ -5080,7 +5080,7 @@ async fn test_rename_thread_from_sidebar_updates_title_override(cx: &mut TestApp
 
     let renamed_title = "abcdefghijklmnopqrstuvwxyé renamed";
     sidebar.update_in(cx, |sidebar, window, cx| {
-        sidebar.start_renaming_thread(entry_ix, thread_id, title, window, cx);
+        sidebar.start_renaming_entry(entry_ix, RenameTarget::Thread(thread_id), title, window, cx);
     });
     cx.run_until_parked();
     sidebar.update_in(cx, |sidebar, window, cx| {
@@ -5090,7 +5090,7 @@ async fn test_rename_thread_from_sidebar_updates_title_override(cx: &mut TestApp
     });
     cx.run_until_parked();
     sidebar.update_in(cx, |sidebar, window, cx| {
-        sidebar.finish_thread_rename(window, cx);
+        sidebar.finish_rename(window, cx);
     });
     cx.run_until_parked();
 
@@ -5212,8 +5212,8 @@ async fn test_rename_selected_thread_action_renames_selected_thread(cx: &mut Tes
 
     sidebar.read_with(cx, |sidebar, _cx| {
         assert_eq!(
-            sidebar.renaming_thread_id,
-            Some(thread_id),
+            sidebar.renaming_entry,
+            Some(RenameTarget::Thread(thread_id)),
             "dispatching RenameSelectedThread should start renaming the selected thread"
         );
     });
@@ -5226,7 +5226,7 @@ async fn test_rename_selected_thread_action_renames_selected_thread(cx: &mut Tes
     });
     cx.run_until_parked();
     sidebar.update_in(cx, |sidebar, window, cx| {
-        sidebar.finish_thread_rename(window, cx);
+        sidebar.finish_rename(window, cx);
     });
     cx.run_until_parked();
 
