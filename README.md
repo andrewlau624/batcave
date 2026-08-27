@@ -12,25 +12,6 @@ This repo is a Zed fork personalized for parallelization across multiple repos a
   </tr>
 </table>
 
-> [!IMPORTANT]
-> Remove this line to confirm you've reviewed this PR before submitting.
-
-# Batcave
-
-<p align="center">
-  <img src="crates/zed/resources/app-icon.png" alt="Batcave logo" width="200" />
-</p>
-
-Welcome to my Batcave.
-
-This is a fork of [Zed](https://github.com/zed-industries/zed) — the high-performance, multiplayer code editor from the creators of [Atom](https://github.com/atom/atom) and [Tree-sitter](https://github.com/tree-sitter/tree-sitter) — that I've personalized for parallelizing workflows.
-
-It's called Batcave because I like Batman, and this is my own personal tool. My own batcave, if you will. It's built the way I like it, with the things I use every day.
-
-[![CI](https://github.com/andrewlau624/bonsai/actions/workflows/run_tests.yml/badge.svg)](https://github.com/andrewlau624/bonsai/actions/workflows/run_tests.yml)
-
----
-
 ### Installing
 
 Build the app and install it into your Applications folder:
