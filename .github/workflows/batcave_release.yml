@@ -31,7 +31,11 @@ jobs:
   bundle_mac:
     # Mirrors upstream's owner guard so this stays inert if the repo is re-forked.
     if: github.repository_owner == 'andrewlau624'
-    runs-on: macos-14
+    # macos-14's default Xcode (15.4) fails to compile webrtc-sys's cxx-bridge
+    # bindings against its libc++ (undefined std::__pointer_traits_element_type
+    # for rust::Slice::iterator under hardened pointer_traits). macos-15's
+    # newer default toolchain (Xcode 16.4) does not hit this.
+    runs-on: macos-15
     steps:
       - name: Check out the tag
         uses: actions/checkout@v4
@@ -70,8 +74,11 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: batcave-release-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: batcave-release-${{ runner.os }}-
+          # Keyed on the runner image, not just runner.os: that resolves to
+          # "macOS" for every mac image, which would let artifacts built
+          # against one Xcode's libc++ be restored onto a different one.
+          key: batcave-release-macos-15-${{ hashFiles('Cargo.lock') }}
+          restore-keys: batcave-release-macos-15-
 
       - name: Select the stable release channel
         # crates/zed/RELEASE_CHANNEL is `dev` in-tree, and
